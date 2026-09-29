@@ -150,7 +150,7 @@ pub struct App {
     /// ever climbs, so on its own it cannot say whether the trouble is now or was an
     /// hour ago; `dropped_at` is what answers that.
     pub audio_dropouts: u64,
-    dropped_at: Option<std::time::Instant>,
+    pub(crate) dropped_at: Option<std::time::Instant>,
     pub status: Option<String>,
     /// Filled with a reason when the session ends; the interface closes once it is set.
     pub ended: Option<String>,

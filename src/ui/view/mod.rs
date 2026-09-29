@@ -438,9 +438,15 @@ mod pictures {
     /// columns hold whatever monospace face the reader's browser happens to pick — the
     /// thing a pasted block of terminal text cannot promise.
     fn svg(app: &App, cols: u16, rows: u16) -> String {
-        let theme = Theme::from_env();
+        flat_svg(app, cols, rows, &Theme::from_env(), 8.0)
+    }
+
+    /// The same drawing with the theme and corner radius chosen by the caller. The
+    /// showcase wants square corners: a rounded picture leaves transparent corners that
+    /// a GIF can only fill with black.
+    fn flat_svg(app: &App, cols: u16, rows: u16, theme: &Theme, radius: f32) -> String {
         let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
-        terminal.draw(|frame| draw(frame, app, &theme)).unwrap();
+        terminal.draw(|frame| draw(frame, app, theme)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let ground = hex(theme.surface().bg.unwrap_or(Color::Reset), "#1a1512");
@@ -454,7 +460,7 @@ mod pictures {
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.0}\" height=\"{h:.0}\" \
              viewBox=\"0 0 {w:.0} {h:.0}\" font-family=\"ui-monospace,SFMono-Regular,\
              Menlo,Consolas,'Liberation Mono',monospace\" font-size=\"{FONT}\">\n\
-             <rect width=\"{w:.0}\" height=\"{h:.0}\" rx=\"8\" fill=\"{ground}\"/>\n"
+             <rect width=\"{w:.0}\" height=\"{h:.0}\" rx=\"{radius}\" fill=\"{ground}\"/>\n"
         );
 
         for y in 0..rows {
@@ -963,5 +969,236 @@ mod pictures {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         println!("Successfully generated assets/demo.mp4 and assets/demo.gif!");
+    }
+
+    /// The Ratatui showcase recording: the terminal alone, as VHS would capture it.
+    ///
+    /// No window, no camera, nothing zooming — the showcase asks for calm motion and
+    /// the subject filling the frame. What moves is the interface: someone joins, the
+    /// string pulls taut, a voice travels down it, the link falls back to a relay and
+    /// sags, the audio breaks up and it frays, and the audio screen opens over it.
+    /// Written under `target/` because the showcase asks for media to live outside
+    /// the repository.
+    ///
+    ///     cargo test --lib -- --ignored --nocapture showcase_gif
+    #[test]
+    #[ignore = "generates target/showcase/ using rsvg-convert and ffmpeg"]
+    fn showcase_gif() {
+        const COLS: u16 = 100;
+        const ROWS: u16 = 22;
+        const WIDTH: &str = "1000";
+        const FPS: u64 = 20;
+        const FRAME_MS: u64 = 1000 / FPS;
+
+        // Each scene is long enough to read before the next one starts.
+        const JOIN: usize = 50;
+        const TALK: usize = 80;
+        const BOB_SAYS: usize = 125;
+        const TYPE: usize = 160;
+        const SEND: usize = 225;
+        const RELAY: usize = 245;
+        const RELAY_SAYS: usize = 265;
+        const FRAY: usize = 320;
+        const MEND: usize = 370;
+        const SETTINGS: usize = 395;
+        const BACK: usize = 470;
+        const TOTAL: usize = 500;
+
+        let out_dir = std::path::Path::new("target/showcase");
+        let frames = out_dir.join("frames");
+        let _ = std::fs::remove_dir_all(&frames);
+        std::fs::create_dir_all(&frames).unwrap();
+
+        let theme = Theme::dark_true();
+        let me = PeerId([1; 32]);
+        let bob = PeerId([2; 32]);
+        let direct = |rtt: u64, peers: usize| crate::net::voice::LinkStatus {
+            direct: peers,
+            relayed: 0,
+            worst_rtt: (peers > 0).then(|| std::time::Duration::from_millis(rtt)),
+        };
+
+        let mut app = App::new(me, "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into());
+        app.apply(Event::Welcome {
+            me,
+            room: RoomSnapshot {
+                room_name: "lobby".into(),
+                channels: vec!["general".into(), "gaming".into(), "music".into()],
+                peers: vec![peer(1, "alice", Some(ChannelId(0)))],
+                recent_chat: vec![],
+            },
+        });
+        app.voice = Some(ChannelId(0));
+        app.voice_available = true;
+        app.motion = true;
+        app.link = direct(0, 0);
+        app.active_input_name = Some("MacBook Pro Microphone".into());
+        app.active_output_name = Some("AirPods Pro".into());
+        app.input_gate = 0.23;
+        app.typing_volume = 0.4;
+        app.input_devices = vec![
+            device("MacBook Pro Microphone", 48_000, true),
+            device("AirPods Pro", 48_000, false),
+        ];
+        app.output_devices = vec![
+            device("MacBook Pro Speakers", 48_000, true),
+            device("AirPods Pro", 48_000, false),
+        ];
+
+        let reply = "loud and clear, no server in between";
+        let say = |app: &mut App, from: PeerId, text: &str, at: u64| {
+            app.apply(Event::Chat(ChatLine {
+                channel: ChannelId(0),
+                from,
+                text: text.into(),
+                at: 1_757_000_000 + at,
+            }));
+        };
+
+        println!("Rendering {TOTAL} frames...");
+        for f in 0..TOTAL {
+            let now = std::time::Instant::now();
+            app.started = now - std::time::Duration::from_millis(f as u64 * FRAME_MS);
+            let since = |start: usize| now - std::time::Duration::from_millis((f - start) as u64 * FRAME_MS);
+
+            match f {
+                JOIN => {
+                    app.apply(Event::Roster(vec![
+                        peer(1, "alice", Some(ChannelId(0))),
+                        peer(2, "bob", Some(ChannelId(0))),
+                        peer(3, "cem", Some(ChannelId(1))),
+                    ]));
+                    app.link = direct(18, 2);
+                }
+                BOB_SAYS => say(&mut app, bob, "hey, can you hear me alright?", 0),
+                SEND => {
+                    say(&mut app, me, reply, 40);
+                    app.input.clear();
+                }
+                RELAY => {
+                    app.link = crate::net::voice::LinkStatus {
+                        direct: 1,
+                        relayed: 1,
+                        worst_rtt: Some(std::time::Duration::from_millis(140)),
+                    };
+                }
+                RELAY_SAYS => say(&mut app, bob, "on hotel wifi now, coming through a relay", 95),
+                MEND => {
+                    app.dropped_at = None;
+                    app.link = direct(18, 2);
+                }
+                SETTINGS => {
+                    app.view_mode = ViewMode::Settings;
+                    app.settings_section = SettingsSection::InputDevice;
+                }
+                BACK => app.view_mode = ViewMode::Chat,
+                _ => {}
+            }
+
+            // Bob talks over the taut string, then again over the relay and the fray —
+            // the pulse slows down with the round trip.
+            let talking = (TALK..TYPE).contains(&f) || (RELAY_SAYS..MEND).contains(&f);
+            if talking {
+                app.speaking.insert(bob);
+                let level = [2, 4, 3, 5, 3, 1, 4, 2][(f / 3) % 8];
+                app.peer_levels.insert(bob, level);
+            } else {
+                app.speaking.clear();
+                app.peer_levels.clear();
+            }
+
+            if (TYPE..SEND).contains(&f) {
+                let typed = ((f - TYPE) * reply.len() / (SEND - TYPE - 12)).min(reply.len());
+                app.input = reply[..typed].to_string();
+            }
+
+            // Held fresh for the whole scene; the real app notes each new dropout.
+            if (FRAY..MEND).contains(&f) {
+                app.dropped_at = Some(now);
+            }
+
+            if (SETTINGS..BACK).contains(&f) {
+                app.mode_transition_at = Some(since(SETTINGS));
+                // A voice with some life in it, riding over the noise floor.
+                let t = (f - SETTINGS) as f32 * 0.35;
+                app.mic_level = (0.38 + 0.2 * t.sin() + 0.08 * (t * 2.7).sin()).clamp(0.0, 1.0);
+            } else if f >= BACK {
+                app.mode_transition_at = Some(since(BACK));
+            }
+
+            let picture = flat_svg(&app, COLS, ROWS, &theme, 0.0);
+            std::fs::write(frames.join(format!("frame_{f:04}.svg")), picture).unwrap();
+        }
+
+        println!("Rasterizing...");
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let chunk = TOTAL.div_ceil(threads);
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let dir = frames.clone();
+                s.spawn(move || {
+                    for i in (t * chunk)..((t + 1) * chunk).min(TOTAL) {
+                        let status = std::process::Command::new("rsvg-convert")
+                            .args(["-w", WIDTH, "-a", "-f", "png", "-o"])
+                            .arg(dir.join(format!("frame_{i:04}.png")))
+                            .arg(dir.join(format!("frame_{i:04}.svg")))
+                            .status()
+                            .expect("rsvg-convert is required");
+                        assert!(status.success(), "rsvg-convert failed on frame {i}");
+                    }
+                });
+            }
+        });
+
+        let input = frames.join("frame_%04d.png");
+        let input = input.to_str().unwrap();
+        let fps = FPS.to_string();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error"])
+                .args(args)
+                .status()
+                .expect("ffmpeg is required");
+            assert!(status.success(), "ffmpeg failed: {args:?}");
+        };
+        run(&[
+            "-framerate", &fps, "-i", input,
+            "-filter_complex",
+            "split[a][b];[a]palettegen=max_colors=64:stats_mode=full[p];[b][p]paletteuse=dither=none",
+            "target/showcase/tincan.gif",
+        ]);
+        // ffmpeg writes every frame whole, so a mostly still interface comes out at
+        // ~15 MB — over GitHub's attachment limit. Pillow folds identical frames into
+        // one longer one and writes only what changed, with ffmpeg's palette kept —
+        // all but its transparency green, which the half-covered bottom row of pixels
+        // would otherwise be matched to.
+        let squeeze = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "from PIL import Image, ImageSequence\n\
+                 src = Image.open('target/showcase/tincan.gif')\n\
+                 colours = src.getpalette()\n\
+                 for i in range(0, len(colours), 3):\n    \
+                     if colours[i:i + 3] == [0, 255, 0]: colours[i:i + 3] = [20, 16, 12]\n\
+                 pal = Image.new('P', (1, 1)); pal.putpalette(colours)\n\
+                 out = []\n\
+                 for f in ImageSequence.Iterator(src):\n    \
+                     p = f.convert('RGB').quantize(palette=pal, dither=Image.Dither.NONE)\n    \
+                     p.info.clear(); out.append(p)\n\
+                 out[0].save('target/showcase/tincan.gif', save_all=True, append_images=out[1:], duration=50, loop=0)\n",
+            ])
+            .status();
+        if !squeeze.is_ok_and(|s| s.success()) {
+            eprintln!("python3 with Pillow is not available; tincan.gif is left unoptimised");
+        }
+        run(&[
+            "-framerate", &fps, "-i", input,
+            // x264 wants even sides; the height is whatever the cell grid came to.
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+            "target/showcase/tincan.mp4",
+        ]);
+        std::fs::copy(frames.join(format!("frame_{:04}.png", BOB_SAYS + 20)), "target/showcase/tincan.png").unwrap();
+        println!("Wrote target/showcase/tincan.{{gif,mp4,png}}");
     }
 }
