@@ -510,8 +510,6 @@ pub struct DeviceChoice {
     pub output: Wanted,
 }
 
-/// Picks a device by name. Matching is case-insensitive and partial, so the user can
-/// type any distinctive part of a name from the `tincan devices` output.
 /// The audio callback cannot rebuild its own stream, so all it does is say that the
 /// stream is gone. `recover` picks it up from there.
 fn on_error(
@@ -546,6 +544,8 @@ fn open_wanted(
     }
 }
 
+/// Picks a device by name. Matching is case-insensitive and partial, so the user can
+/// type any distinctive part of a name from the `tincan devices` output.
 fn pick(mut devices: impl Iterator<Item = cpal::Device>, wanted: &str) -> Option<cpal::Device> {
     let wanted = wanted.to_lowercase();
     devices.find(|d| {
