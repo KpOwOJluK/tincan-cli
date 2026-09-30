@@ -286,7 +286,10 @@ mod tests {
         let theme = Theme::from_env();
 
         let full = fit(&app, 80, &theme);
-        assert!(full.contains("←→"), "the dials are only discoverable from here: {full}");
+        assert!(
+            full.contains("←→"),
+            "the dials are only discoverable from here: {full}"
+        );
         for width in [70, 55, 40, 20, 4] {
             assert!(fit(&app, width, &theme).chars().count() <= width);
         }
@@ -334,18 +337,30 @@ mod tests {
         for width in [72, 76, 80, 100] {
             let screen = rendered(width, 24, &room());
             let footer = screen.lines().last().unwrap();
-            assert!(footer.contains("f1 code"), "lost the code at {width}: {footer}");
+            assert!(
+                footer.contains("f1 code"),
+                "lost the code at {width}: {footer}"
+            );
         }
     }
 
     #[test]
     fn a_narrow_terminal_drops_the_rail_and_keeps_the_talk() {
         let wide = rendered(80, 24, &room());
-        assert!(wide.contains("CHANNELS"), "the rail belongs on a normal terminal");
+        assert!(
+            wide.contains("CHANNELS"),
+            "the rail belongs on a normal terminal"
+        );
 
         let narrow = rendered(50, 24, &room());
-        assert!(!narrow.contains("CHANNELS"), "the rail must give way:\n{narrow}");
-        assert!(narrow.contains("say something"), "the message field must survive:\n{narrow}");
+        assert!(
+            !narrow.contains("CHANNELS"),
+            "the rail must give way:\n{narrow}"
+        );
+        assert!(
+            narrow.contains("say something"),
+            "the message field must survive:\n{narrow}"
+        );
     }
 
     #[test]
@@ -379,7 +394,10 @@ mod tests {
     fn clipping_marks_what_it_cut() {
         let theme = Theme::from_env();
         assert_eq!(clip("general", 20, &theme), "general");
-        assert_eq!(clip("a very long device name", 8, &theme).chars().count(), 8);
+        assert_eq!(
+            clip("a very long device name", 8, &theme).chars().count(),
+            8
+        );
         assert!(clip("a very long device name", 8, &theme).starts_with("a very"));
         assert_eq!(clip("abc", 0, &theme), "");
     }
@@ -389,7 +407,10 @@ mod tests {
         let app = room();
         let theme = Theme::from_env();
         assert!(fit(&app, 80, &theme).contains("f3 mute"));
-        assert!(fit(&app, 55, &theme).contains("f3 mute"), "the ladder must not skip a rung");
+        assert!(
+            fit(&app, 55, &theme).contains("f3 mute"),
+            "the ladder must not skip a rung"
+        );
         assert!(fit(&app, 40, &theme).chars().count() <= 40);
         assert!(fit(&app, 12, &theme).chars().count() <= 12);
         assert!(fit(&app, 3, &theme).chars().count() <= 3);
@@ -429,7 +450,9 @@ mod pictures {
     }
 
     fn escape(text: &str) -> String {
-        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     /// Draws the interface and writes it out as SVG.
@@ -555,7 +578,10 @@ mod pictures {
     /// The room mid-conversation: three people, one of them turned down.
     fn hero() -> App {
         let me = PeerId([1; 32]);
-        let mut app = App::new(me, "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into());
+        let mut app = App::new(
+            me,
+            "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into(),
+        );
         app.apply(Event::Welcome {
             me,
             room: RoomSnapshot {
@@ -648,7 +674,8 @@ mod pictures {
         for (name, app, rows) in [("room", hero(), 22u16), ("audio", settings(), 22)] {
             let path = format!("assets/{name}.svg");
             let picture = svg(&app, 84, rows);
-            std::fs::write(&path, &picture).unwrap_or_else(|e| panic!("could not write {path}: {e}"));
+            std::fs::write(&path, &picture)
+                .unwrap_or_else(|e| panic!("could not write {path}: {e}"));
             println!("{path} — {} bytes", picture.len());
         }
     }
@@ -700,7 +727,11 @@ mod pictures {
         let room_title = if app.room_name.is_empty() {
             "tincan".to_string()
         } else {
-            format!("tincan — {} (#{})", app.room_name, app.channel_name(app.viewing))
+            format!(
+                "tincan — {} (#{})",
+                app.room_name,
+                app.channel_name(app.viewing)
+            )
         };
 
         let mut out = format!(
@@ -726,10 +757,14 @@ mod pictures {
                <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"5.5\" fill=\"#27c93f\"/>\n\
                <text x=\"{:.1}\" y=\"{:.1}\" fill=\"#8a8177\" font-family=\"-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif\" font-size=\"12\" font-weight=\"500\" text-anchor=\"middle\">{}</text>\n\
                <rect x=\"{win_x:.1}\" y=\"{:.1}\" width=\"{win_w:.1}\" height=\"{:.1}\" fill=\"{ground}\"/>\n",
-            win_x + 20.0, win_y + 18.0,
-            win_x + 38.0, win_y + 18.0,
-            win_x + 56.0, win_y + 18.0,
-            win_x + win_w / 2.0, win_y + 22.0,
+            win_x + 20.0,
+            win_y + 18.0,
+            win_x + 38.0,
+            win_y + 18.0,
+            win_x + 56.0,
+            win_y + 18.0,
+            win_x + win_w / 2.0,
+            win_y + 22.0,
             escape(&room_title),
             win_y + WIN_BAR_H,
             win_h - WIN_BAR_H
@@ -786,7 +821,10 @@ mod pictures {
         let bob = PeerId([2; 32]);
 
         // Start with clean room and cans diagram clearly visible
-        let mut app = App::new(me, "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into());
+        let mut app = App::new(
+            me,
+            "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into(),
+        );
         app.apply(Event::Welcome {
             me,
             room: RoomSnapshot {
@@ -815,10 +853,26 @@ mod pictures {
         app.peer_gains.insert(PeerId([3; 32]), 0.0);
 
         const TOTAL_FRAMES: usize = 240;
-        const OVERVIEW: Camera = Camera { x: 640.0, y: 360.0, zoom: 1.0 };
-        const VOICE_FOCUS: Camera = Camera { x: 570.0, y: 350.0, zoom: 1.35 };
-        const CHAT_FOCUS: Camera = Camera { x: 670.0, y: 400.0, zoom: 1.35 };
-        const SETTINGS_FOCUS: Camera = Camera { x: 640.0, y: 320.0, zoom: 1.30 };
+        const OVERVIEW: Camera = Camera {
+            x: 640.0,
+            y: 360.0,
+            zoom: 1.0,
+        };
+        const VOICE_FOCUS: Camera = Camera {
+            x: 570.0,
+            y: 350.0,
+            zoom: 1.35,
+        };
+        const CHAT_FOCUS: Camera = Camera {
+            x: 670.0,
+            y: 400.0,
+            zoom: 1.35,
+        };
+        const SETTINGS_FOCUS: Camera = Camera {
+            x: 640.0,
+            y: 320.0,
+            zoom: 1.30,
+        };
 
         let prompt_text = "loud and clear! tincan is fast";
 
@@ -851,7 +905,12 @@ mod pictures {
             // Voice & Pulse simulation (Bob speaks)
             if (35..85).contains(&f) {
                 app.speaking.insert(bob);
-                let level = match (f / 3) % 4 { 0 => 2, 1 => 4, 2 => 3, _ => 5 };
+                let level = match (f / 3) % 4 {
+                    0 => 2,
+                    1 => 4,
+                    2 => 3,
+                    _ => 5,
+                };
                 app.peer_levels.insert(bob, level);
             } else {
                 app.speaking.clear();
@@ -913,7 +972,9 @@ mod pictures {
         }
 
         println!("Rasterizing SVG frames to PNG in parallel...");
-        let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let chunk_size = TOTAL_FRAMES.div_ceil(num_threads);
 
         std::thread::scope(|s| {
@@ -941,12 +1002,18 @@ mod pictures {
         let mp4_status = std::process::Command::new("ffmpeg")
             .args([
                 "-y",
-                "-framerate", "20",
-                "-i", temp_dir.join("frame_%04d.png").to_str().unwrap(),
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-crf", "18",
-                "-preset", "medium",
+                "-framerate",
+                "20",
+                "-i",
+                temp_dir.join("frame_%04d.png").to_str().unwrap(),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                "18",
+                "-preset",
+                "medium",
                 "assets/demo.mp4",
             ])
             .status()
@@ -1018,7 +1085,10 @@ mod pictures {
             worst_rtt: (peers > 0).then(|| std::time::Duration::from_millis(rtt)),
         };
 
-        let mut app = App::new(me, "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into());
+        let mut app = App::new(
+            me,
+            "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into(),
+        );
         app.apply(Event::Welcome {
             me,
             room: RoomSnapshot {
@@ -1059,7 +1129,9 @@ mod pictures {
         for f in 0..TOTAL {
             let now = std::time::Instant::now();
             app.started = now - std::time::Duration::from_millis(f as u64 * FRAME_MS);
-            let since = |start: usize| now - std::time::Duration::from_millis((f - start) as u64 * FRAME_MS);
+            let since = |start: usize| {
+                now - std::time::Duration::from_millis((f - start) as u64 * FRAME_MS)
+            };
 
             match f {
                 JOIN => {
@@ -1082,7 +1154,12 @@ mod pictures {
                         worst_rtt: Some(std::time::Duration::from_millis(140)),
                     };
                 }
-                RELAY_SAYS => say(&mut app, bob, "on hotel wifi now, coming through a relay", 95),
+                RELAY_SAYS => say(
+                    &mut app,
+                    bob,
+                    "on hotel wifi now, coming through a relay",
+                    95,
+                ),
                 MEND => {
                     app.dropped_at = None;
                     app.link = direct(18, 2);
@@ -1131,7 +1208,9 @@ mod pictures {
         }
 
         println!("Rasterizing...");
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let chunk = TOTAL.div_ceil(threads);
         std::thread::scope(|s| {
             for t in 0..threads {
@@ -1162,7 +1241,10 @@ mod pictures {
             assert!(status.success(), "ffmpeg failed: {args:?}");
         };
         run(&[
-            "-framerate", &fps, "-i", input,
+            "-framerate",
+            &fps,
+            "-i",
+            input,
             "-filter_complex",
             "split[a][b];[a]palettegen=max_colors=64:stats_mode=full[p];[b][p]paletteuse=dither=none",
             "target/showcase/tincan.gif",
@@ -1192,13 +1274,26 @@ mod pictures {
             eprintln!("python3 with Pillow is not available; tincan.gif is left unoptimised");
         }
         run(&[
-            "-framerate", &fps, "-i", input,
+            "-framerate",
+            &fps,
+            "-i",
+            input,
             // x264 wants even sides; the height is whatever the cell grid came to.
-            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
             "target/showcase/tincan.mp4",
         ]);
-        std::fs::copy(frames.join(format!("frame_{:04}.png", BOB_SAYS + 20)), "target/showcase/tincan.png").unwrap();
+        std::fs::copy(
+            frames.join(format!("frame_{:04}.png", BOB_SAYS + 20)),
+            "target/showcase/tincan.png",
+        )
+        .unwrap();
         println!("Wrote target/showcase/tincan.{{gif,mp4,png}}");
     }
 }

@@ -122,7 +122,10 @@ impl VoiceMesh {
         let peer = to_peer_id(conn.remote_id());
         let shared = self.shared.clone();
         tokio::spawn(async move {
-            debug!("voice connection established with {} (incoming)", peer.short());
+            debug!(
+                "voice connection established with {} (incoming)",
+                peer.short()
+            );
             shared.connections.lock().await.insert(peer, conn.clone());
             read_loop(shared.clone(), conn, peer).await;
             shared.connections.lock().await.remove(&peer);
@@ -192,12 +195,18 @@ impl VoiceMesh {
             };
             match endpoint.connect(target, proto::VOICE_ALPN).await {
                 Ok(conn) => {
-                    debug!("voice connection established with {} (outgoing)", peer.short());
+                    debug!(
+                        "voice connection established with {} (outgoing)",
+                        peer.short()
+                    );
                     shared.connections.lock().await.insert(peer, conn.clone());
                     read_loop(shared.clone(), conn, peer).await;
                     shared.connections.lock().await.remove(&peer);
                 }
-                Err(err) => debug!("could not open a voice connection to peer {}: {err}", peer.short()),
+                Err(err) => debug!(
+                    "could not open a voice connection to peer {}: {err}",
+                    peer.short()
+                ),
             }
         });
     }
