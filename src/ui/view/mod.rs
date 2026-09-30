@@ -108,7 +108,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // then the number.
     let strand = strand::of(app);
     let named = if app.link.peers() >= 2 {
-        app.worst_trouble()
+        named_trouble(app)
     } else {
         None
     };
@@ -225,6 +225,22 @@ fn spread(width: u16, left: Vec<Span<'static>>, right: Vec<Span<'static>>) -> Te
         spans.extend(right);
     }
     TextLine::from(spans)
+}
+
+/// The link worth naming on screen, if any. While audio is breaking up nobody is
+/// named: a dropout is measured in our own playback and does not say whose audio was
+/// late, and a name beside `CHOPPY` would read as blame.
+fn named_trouble(
+    app: &App,
+) -> Option<(
+    crate::proto::PeerId,
+    crate::ui::state::Trouble,
+    crate::net::voice::PeerLink,
+)> {
+    if matches!(strand::of(app), crate::ui::theme::Strand::Frayed) {
+        return None;
+    }
+    app.worst_trouble()
 }
 
 /// A round trip as the interface writes it everywhere. Past a second the exact figure
@@ -567,6 +583,29 @@ mod tests {
         let top = header(40, &app);
         assert!(top.contains("RELAY") && top.contains("340ms"), "{top}");
         assert!(!top.contains("emre"), "{top}");
+    }
+
+    #[test]
+    fn a_choppy_call_blames_nobody_in_the_header() {
+        let mut app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        app.dropped_at = Some(std::time::Instant::now());
+        let top = header(80, &app);
+        assert!(
+            top.contains("audio dropping") && top.contains("CHOPPY"),
+            "{top}"
+        );
+        assert!(
+            !top.contains("emre"),
+            "dropouts are not anyone's fault we can name: {top}"
+        );
     }
 
     #[test]

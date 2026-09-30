@@ -294,7 +294,7 @@ fn margin_for(width: u16) -> String {
 /// Who the far can stands for: the person the worst link belongs to, so the number
 /// written on the string is theirs; otherwise the first of the others, as ever.
 fn far_end<'a>(app: &'a App, others: &[&'a str]) -> Option<&'a str> {
-    app.worst_trouble()
+    super::named_trouble(app)
         .and_then(|(id, _, _)| app.peers.iter().find(|p| p.id == id))
         .map(|p| p.name.as_str())
         .or_else(|| others.first().copied())
@@ -465,8 +465,7 @@ fn closing(margin: &str, app: &App, theme: &Theme, others: &[&str]) -> Vec<TextL
 fn link_label(app: &App, theme: &Theme) -> String {
     let words = strand::label(app).to_lowercase();
     // The number belongs to the person on the far can.
-    let rtt = app
-        .worst_trouble()
+    let rtt = super::named_trouble(app)
         .map(|(_, _, link)| link.rtt)
         .or(app.link.worst_rtt);
     match rtt {
@@ -891,6 +890,15 @@ mod tests {
         let app = with_cem(&[(2, false, 20), (3, false, 30)]);
         let rows = cans(70, &app, &Theme::from_env());
         assert!(text(&rows[0]).contains("bob"), "{}", text(&rows[0]));
+    }
+
+    #[test]
+    fn a_choppy_call_keeps_the_first_person_on_the_far_can() {
+        let mut app = with_cem(&[(2, false, 20), (3, true, 340)]);
+        app.dropped_at = Some(std::time::Instant::now());
+        let rows = cans(70, &app, &Theme::from_env());
+        assert!(text(&rows[0]).contains("bob"), "{}", text(&rows[0]));
+        assert!(!text(&rows[0]).contains("cem"), "{}", text(&rows[0]));
     }
 
     #[test]
