@@ -731,6 +731,7 @@ mod tests {
             direct: 1,
             relayed: 0,
             worst_rtt: Some(std::time::Duration::from_millis(18)),
+            ..Default::default()
         };
         said(&mut app, 2, 1000, "hi");
 
@@ -787,6 +788,7 @@ mod tests {
             direct: 1,
             relayed: 0,
             worst_rtt: Some(std::time::Duration::from_millis(18)),
+            ..Default::default()
         };
         let drawn: String = diagram(Rect::new(0, 0, 70, 20), &app, &Theme::from_env())
             .iter()

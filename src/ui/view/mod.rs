@@ -604,6 +604,7 @@ mod pictures {
             direct: 2,
             relayed: 0,
             worst_rtt: Some(std::time::Duration::from_millis(18)),
+            ..Default::default()
         };
         app.active_input_name = Some("MacBook Pro Microphone".into());
         app.active_output_name = Some("AirPods Pro".into());
@@ -845,6 +846,7 @@ mod pictures {
             direct: 2,
             relayed: 0,
             worst_rtt: Some(std::time::Duration::from_millis(18)),
+            ..Default::default()
         };
         app.active_input_name = Some("MacBook Pro Microphone".into());
         app.active_output_name = Some("AirPods Pro".into());
@@ -1083,6 +1085,7 @@ mod pictures {
             direct: peers,
             relayed: 0,
             worst_rtt: (peers > 0).then(|| std::time::Duration::from_millis(rtt)),
+            ..Default::default()
         };
 
         let mut app = App::new(
@@ -1152,6 +1155,7 @@ mod pictures {
                         direct: 1,
                         relayed: 1,
                         worst_rtt: Some(std::time::Duration::from_millis(140)),
+                        ..Default::default()
                     };
                 }
                 RELAY_SAYS => say(
