@@ -856,6 +856,11 @@ mod tests {
             afk: false,
         });
         app.voice_available = true;
+        // Links are only kept for people in the call we are in.
+        for peer in &mut app.peers {
+            peer.channel = Some(crate::proto::ChannelId(0));
+        }
+        app.voice = Some(crate::proto::ChannelId(0));
         let per_peer: std::collections::BTreeMap<_, _> = readings
             .iter()
             .map(|&(seed, relayed, ms)| {

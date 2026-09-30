@@ -278,11 +278,13 @@ impl App {
                 // Our own state comes from the server's list, so it stays right
                 // across a reconnect too.
                 self.sync_self_from_roster();
+                self.prune_link();
             }
             Event::Roster(peers) => {
                 self.peers = peers;
                 self.remember_names();
                 self.sync_self_from_roster();
+                self.prune_link();
                 // Someone who has left is no longer something the arrow keys may
                 // point at — otherwise a press adjusts a person who is not there.
                 if let Some(selected) = self.selected_peer
@@ -457,17 +459,10 @@ impl App {
     }
 
     /// Takes a fresh reading of the voice links and works out who is slow.
-    ///
-    /// A connection can outlive its person by a moment — it closes on the next
-    /// membership update — so readings for anyone off the roster are dropped here,
-    /// once, rather than in every view that might name them.
-    pub fn take_link(&mut self, mut status: LinkStatus) {
-        status
-            .per_peer
-            .retain(|peer, _| self.peers.iter().any(|p| p.id == *peer));
-        self.slow.retain(|peer| status.per_peer.contains_key(peer));
-        self.over.retain(|peer| status.per_peer.contains_key(peer));
-        for (peer, link) in &status.per_peer {
+    pub fn take_link(&mut self, status: LinkStatus) {
+        self.link = status;
+        self.prune_link();
+        for (peer, link) in &self.link.per_peer {
             if link.relayed || link.rtt < SLOW_UNTIL {
                 self.slow.remove(peer);
                 self.over.remove(peer);
@@ -482,7 +477,39 @@ impl App {
                 self.over.remove(peer);
             }
         }
-        self.link = status;
+    }
+
+    /// Keeps the link only for the people in the call we are in, and counts the
+    /// summary from what is left.
+    ///
+    /// A connection can outlive its person by a moment — it closes on the next
+    /// membership update, and is only read again on the next tick — so this runs on
+    /// every reading and on every roster change. That way no view names someone who
+    /// has left or moved, and the chip never says `RELAY` because of them.
+    fn prune_link(&mut self) {
+        let in_call: HashSet<PeerId> = match self.voice {
+            Some(channel) => self
+                .peers
+                .iter()
+                .filter(|p| p.id != self.me && p.channel == Some(channel))
+                .map(|p| p.id)
+                .collect(),
+            None => HashSet::new(),
+        };
+        self.link.per_peer.retain(|peer, _| in_call.contains(peer));
+        self.slow
+            .retain(|peer| self.link.per_peer.contains_key(peer));
+        self.over
+            .retain(|peer| self.link.per_peer.contains_key(peer));
+
+        self.link.relayed = self
+            .link
+            .per_peer
+            .values()
+            .filter(|link| link.relayed)
+            .count();
+        self.link.direct = self.link.per_peer.len() - self.link.relayed;
+        self.link.worst_rtt = self.link.per_peer.values().map(|link| link.rtt).max();
     }
 
     /// What is wrong with the link to one person, and the reading that says so.
@@ -1851,5 +1878,80 @@ mod tests {
         let mut app = crowd();
         links(&mut app, &[(2, false, 18), (3, false, 40)]);
         assert_eq!(app.worst_trouble(), None);
+    }
+
+    #[test]
+    fn someone_leaving_takes_their_link_with_them_at_once() {
+        let mut app = crowd();
+        links(&mut app, &[(2, true, 300), (3, false, 20)]);
+        app.apply(Event::Roster(vec![
+            peer(1, Some(ChannelId(0))),
+            peer(3, Some(ChannelId(0))),
+        ]));
+        assert!(
+            !app.link.per_peer.contains_key(&PeerId([2; 32])),
+            "not on the next reading, now"
+        );
+        assert_eq!(app.link.relayed, 0, "the summary forgets them too");
+        assert_eq!(app.link.direct, 1);
+        assert_eq!(app.link.worst_rtt, Some(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn someone_switching_channel_drops_out_of_the_call_at_once() {
+        let mut app = crowd();
+        links(&mut app, &[(2, true, 300), (3, false, 20)]);
+        app.apply(Event::Roster(vec![
+            peer(1, Some(ChannelId(0))),
+            peer(2, Some(ChannelId(1))),
+            peer(3, Some(ChannelId(0))),
+        ]));
+        assert_eq!(app.trouble(PeerId([2; 32])), None);
+        assert_eq!(app.link.relayed, 0);
+    }
+
+    #[test]
+    fn leaving_the_call_empties_the_link() {
+        let mut app = crowd();
+        links(&mut app, &[(2, false, 20), (3, false, 30)]);
+        app.apply(Event::Roster(vec![
+            peer(1, None),
+            peer(2, Some(ChannelId(0))),
+            peer(3, Some(ChannelId(0))),
+        ]));
+        assert!(app.link.per_peer.is_empty());
+        assert_eq!(
+            (app.link.direct, app.link.relayed, app.link.worst_rtt),
+            (0, 0, None)
+        );
+    }
+
+    #[test]
+    fn the_summary_is_counted_from_the_people_in_the_call() {
+        let mut app = crowd();
+        // The mesh still holds a relayed connection to someone who has gone.
+        let mut status = LinkStatus {
+            direct: 1,
+            relayed: 1,
+            worst_rtt: Some(Duration::from_millis(300)),
+            ..Default::default()
+        };
+        status.per_peer.insert(
+            PeerId([2; 32]),
+            PeerLink {
+                relayed: false,
+                rtt: Duration::from_millis(18),
+            },
+        );
+        status.per_peer.insert(
+            PeerId([9; 32]),
+            PeerLink {
+                relayed: true,
+                rtt: Duration::from_millis(300),
+            },
+        );
+        app.take_link(status);
+        assert_eq!((app.link.direct, app.link.relayed), (1, 0));
+        assert_eq!(app.link.worst_rtt, Some(Duration::from_millis(18)));
     }
 }

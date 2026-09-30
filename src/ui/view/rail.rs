@@ -772,6 +772,8 @@ mod tests {
             deafened: false,
             afk: false,
         });
+        // Links are only kept for people in the call we are in.
+        app.voice = Some(ChannelId(0));
         app
     }
 
@@ -837,11 +839,12 @@ mod tests {
     #[test]
     fn being_muted_says_more_than_a_bad_link() {
         let theme = Theme::dark_true();
-        let mut app = room();
-        links(&mut app, &[(2, true, 340)]);
-        let rows = people_rows(28, &app, &theme);
-        assert!(text(&rows[1]).contains("muted"), "{}", text(&rows[1]));
-        assert!(!text(&rows[1]).contains("340ms"), "{}", text(&rows[1]));
+        let mut app = with_cem();
+        app.peers[2].muted = true;
+        links(&mut app, &[(3, true, 340)]);
+        let row = cem_row(&app, &theme);
+        assert!(text(&row).contains("muted"), "{}", text(&row));
+        assert!(!text(&row).contains("340ms"), "{}", text(&row));
     }
 
     #[test]

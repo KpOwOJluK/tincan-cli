@@ -609,6 +609,40 @@ mod tests {
     }
 
     #[test]
+    fn at_48_columns_the_whole_reading_fits() {
+        let app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        let top = header(48, &app);
+        assert!(
+            top.contains("RELAY") && top.contains("emre") && top.contains("340ms"),
+            "{top}"
+        );
+    }
+
+    #[test]
+    fn when_only_the_chip_fits_the_number_goes_too() {
+        let app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        let top = header(34, &app);
+        assert!(top.contains("RELAY"), "{top}");
+        assert!(!top.contains("340ms") && !top.contains("emre"), "{top}");
+    }
+
+    #[test]
     fn a_long_name_is_cut_where_the_rail_cuts_it() {
         let app = call(
             &["bob", "bartholomew-the-great"],
