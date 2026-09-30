@@ -102,19 +102,54 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
     }
 
+    // The chip summarises the room. When more than one person is on the line and one
+    // of them is the problem, it says who, so that a terminal too narrow for the
+    // roster still answers the question. If that does not fit, the name goes first,
+    // then the number.
     let strand = strand::of(app);
-    let mut right = Vec::new();
+    let named = if app.link.peers() >= 2 {
+        app.worst_trouble()
+    } else {
+        None
+    };
+    let who = named.and_then(|(id, _, link)| {
+        app.peers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.name.clone(), link.rtt))
+    });
+    let rtt = who.as_ref().map(|(_, rtt)| *rtt).or(app.link.worst_rtt);
+
+    let mut base = Vec::new();
     if app.recently_dropped() {
-        right.push(Span::styled("audio dropping ", theme.error()));
+        base.push(Span::styled("audio dropping ", theme.error()));
     }
-    right.push(Span::styled(
+    base.push(Span::styled(
         format!(" {} ", strand::label(app)),
         theme.chip_link(strand),
     ));
-    if let Some(rtt) = app.link.worst_rtt {
-        right.push(Span::styled(format!(" {}ms", rtt.as_millis()), theme.dim()));
-    }
-    right.push(Span::raw(" "));
+    let name = who.map(|(name, _)| {
+        Span::styled(
+            format!("  {}", clip(&name, rail::NAME_ROOM, theme)),
+            theme.text(),
+        )
+    });
+    let number = rtt.map(|rtt| Span::styled(format!(" {}", millis(rtt)), theme.dim()));
+
+    let with = |parts: &[&Option<Span<'static>>]| {
+        let mut right = base.clone();
+        right.extend(parts.iter().filter_map(|part| (*part).clone()));
+        right.push(Span::raw(" "));
+        right
+    };
+    let fits = |right: &Vec<Span<'static>>| {
+        let used: usize = left.iter().chain(right.iter()).map(Span::width).sum();
+        used < area.width as usize
+    };
+    let right = [with(&[&name, &number]), with(&[&number])]
+        .into_iter()
+        .find(fits)
+        .unwrap_or_else(|| with(&[]));
 
     frame.render_widget(Paragraph::new(spread(area.width, left, right)), area);
 }
@@ -431,6 +466,122 @@ mod tests {
         assert_eq!(millis(Duration::from_millis(999)), "999ms");
         assert_eq!(millis(Duration::from_millis(1000)), ">999ms");
         assert_eq!(millis(Duration::from_secs(120)), ">999ms");
+    }
+    use crate::net::voice::{LinkStatus, PeerLink};
+    use crate::proto::{ChannelId, PeerInfo};
+
+    /// Us plus `names`, all in general, with voice up and the given links (seed = index + 2).
+    fn call(names: &[&str], readings: &[(u8, bool, u64)]) -> App {
+        let mut app = room();
+        let person = |seed: u8, name: &str| PeerInfo {
+            id: PeerId([seed; 32]),
+            name: name.into(),
+            channel: Some(ChannelId(0)),
+            muted: false,
+            deafened: false,
+            afk: false,
+        };
+        app.peers = std::iter::once(person(1, "alice"))
+            .chain(
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| person(i as u8 + 2, name)),
+            )
+            .collect();
+        app.voice = Some(ChannelId(0));
+        app.voice_available = true;
+        let per_peer: std::collections::BTreeMap<_, _> = readings
+            .iter()
+            .map(|&(seed, relayed, ms)| {
+                (
+                    PeerId([seed; 32]),
+                    PeerLink {
+                        relayed,
+                        rtt: std::time::Duration::from_millis(ms),
+                    },
+                )
+            })
+            .collect();
+        app.take_link(LinkStatus {
+            direct: per_peer.values().filter(|l| !l.relayed).count(),
+            relayed: per_peer.values().filter(|l| l.relayed).count(),
+            worst_rtt: per_peer.values().map(|l| l.rtt).max(),
+            per_peer,
+        });
+        app
+    }
+
+    fn header(width: u16, app: &App) -> String {
+        rendered(width, 12, app).lines().next().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_two_person_call_keeps_the_header_it_has_today() {
+        let app = call(&["bob"], &[(2, true, 340)]);
+        let top = header(80, &app);
+        assert!(top.contains("RELAY") && top.contains("340ms"), "{top}");
+        assert!(
+            !top.contains("bob"),
+            "with one other person the name says nothing new: {top}"
+        );
+    }
+
+    #[test]
+    fn a_crowded_call_names_the_relayed_person() {
+        let app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        let top = header(80, &app);
+        assert!(
+            top.contains("RELAY") && top.contains("emre") && top.contains("340ms"),
+            "{top}"
+        );
+    }
+
+    #[test]
+    fn a_crowded_healthy_call_names_nobody() {
+        let app = call(&["bob", "cem"], &[(2, false, 18), (3, false, 31)]);
+        let top = header(80, &app);
+        assert!(top.contains("DIRECT") && top.contains("31ms"), "{top}");
+        assert!(!top.contains("bob") && !top.contains("cem"), "{top}");
+    }
+
+    #[test]
+    fn a_narrow_header_lets_the_name_go_before_the_number() {
+        let app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        let top = header(40, &app);
+        assert!(top.contains("RELAY") && top.contains("340ms"), "{top}");
+        assert!(!top.contains("emre"), "{top}");
+    }
+
+    #[test]
+    fn a_long_name_is_cut_where_the_rail_cuts_it() {
+        let app = call(
+            &["bob", "bartholomew-the-great"],
+            &[(2, false, 18), (3, true, 340)],
+        );
+        let top = header(80, &app);
+        assert!(
+            top.contains("bartholomew"),
+            "cut at 12 like the rail: {top}"
+        );
+        assert!(!top.contains("bartholomew-the-great"), "{top}");
+        assert!(top.contains("340ms"), "{top}");
     }
 }
 

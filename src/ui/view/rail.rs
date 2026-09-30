@@ -19,7 +19,7 @@ const AUDIO_NEEDS: u16 = 14;
 /// A chip row plus the blank line under the section.
 const CHROME_ROWS: u16 = 2;
 /// How much of a name the rail can hold before it has to cut it.
-const NAME_ROOM: usize = 12;
+pub(super) const NAME_ROOM: usize = 12;
 /// How much of the right-hand tag the rail can hold. Exactly wide enough for the two
 /// longest things it ever says — "deafened" and "silenced" — and no wider, because the
 /// column the cursor needs had to come from somewhere.
