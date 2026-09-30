@@ -245,9 +245,12 @@ fn named_trouble(
 
 /// A round trip as the interface writes it everywhere. Past a second the exact figure
 /// stops mattering and would not fit the roster, so it is capped rather than cut.
+/// Under a millisecond (one machine, or a quiet LAN) the truncated figure would read
+/// `0ms`, which looks like no reading at all, so it says `<1ms` instead.
 fn millis(rtt: std::time::Duration) -> String {
     match rtt.as_millis() {
-        ms @ 0..=999 => format!("{ms}ms"),
+        0 => "<1ms".to_string(),
+        ms @ 1..=999 => format!("{ms}ms"),
         _ => ">999ms".to_string(),
     }
 }
@@ -482,6 +485,13 @@ mod tests {
         assert_eq!(millis(Duration::from_millis(999)), "999ms");
         assert_eq!(millis(Duration::from_millis(1000)), ">999ms");
         assert_eq!(millis(Duration::from_secs(120)), ">999ms");
+    }
+    #[test]
+    fn millis_says_under_one_rather_than_zero() {
+        use std::time::Duration;
+        assert_eq!(millis(Duration::ZERO), "<1ms");
+        assert_eq!(millis(Duration::from_micros(999)), "<1ms");
+        assert_eq!(millis(Duration::from_millis(1)), "1ms");
     }
     use crate::net::voice::{LinkStatus, PeerLink};
     use crate::proto::{ChannelId, PeerInfo};
