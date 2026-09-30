@@ -9,11 +9,28 @@ use std::collections::{HashMap, HashSet};
 use crate::audio::MicTest;
 use crate::audio::device::AudioDeviceInfo;
 use crate::net::Event;
-use crate::net::voice::LinkStatus;
+use crate::net::voice::{LinkStatus, PeerLink};
 use crate::proto::{ChannelId, ChatLine, PeerId, PeerInfo};
 
 /// How long a dropout keeps being reported after the audio recovers.
 const DROPOUT_MEMORY: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// A direct link this slow is one you start to hear: replies arrive late enough to
+/// talk over each other. It takes two readings in a row (a second apart) at or over
+/// it, so a single spike does not mark anyone.
+const SLOW_FROM: std::time::Duration = std::time::Duration::from_millis(150);
+/// It has to come back under this before it counts as healthy again, so a round trip
+/// hovering at the edge does not make the roster flicker.
+const SLOW_UNTIL: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// What is wrong with someone's link, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trouble {
+    /// Their audio detours through a relay.
+    Relay,
+    /// Direct, but slow enough to hear.
+    Slow,
+}
 
 /// How long we listen to the room before deciding where its floor is. Long enough to
 /// catch a fan coming round, short enough that nobody wanders off.
@@ -144,6 +161,12 @@ pub struct App {
     pub voice_available: bool,
     /// The quality of the voice connections; refreshed periodically.
     pub link: LinkStatus,
+    /// Who is currently past the slow threshold. Kept between readings because the
+    /// way back is lower than the way in.
+    slow: HashSet<PeerId>,
+    /// Who was at or over the slow threshold on the last reading: one more and they
+    /// are slow.
+    over: HashSet<PeerId>,
     /// Audio dropout counter — above zero means the user heard a crackle. It only
     /// ever climbs, so on its own it cannot say whether the trouble is now or was an
     /// hour ago; `dropped_at` is what answers that.
@@ -215,6 +238,8 @@ impl App {
             started: std::time::Instant::now(),
             voice_available: false,
             link: LinkStatus::default(),
+            slow: HashSet::new(),
+            over: HashSet::new(),
             audio_dropouts: 0,
             dropped_at: None,
             status: None,
@@ -429,6 +454,64 @@ impl App {
                 self.settings_error = None;
             }
         }
+    }
+
+    /// Takes a fresh reading of the voice links and works out who is slow.
+    ///
+    /// A connection can outlive its person by a moment — it closes on the next
+    /// membership update — so readings for anyone off the roster are dropped here,
+    /// once, rather than in every view that might name them.
+    pub fn take_link(&mut self, mut status: LinkStatus) {
+        status
+            .per_peer
+            .retain(|peer, _| self.peers.iter().any(|p| p.id == *peer));
+        self.slow.retain(|peer| status.per_peer.contains_key(peer));
+        self.over.retain(|peer| status.per_peer.contains_key(peer));
+        for (peer, link) in &status.per_peer {
+            if link.relayed || link.rtt < SLOW_UNTIL {
+                self.slow.remove(peer);
+                self.over.remove(peer);
+            } else if link.rtt >= SLOW_FROM {
+                // `insert` is false when they were already over last time: the
+                // second reading in a row.
+                if !self.over.insert(*peer) {
+                    self.slow.insert(*peer);
+                }
+            } else {
+                // Inside the band: a slow link stays slow, a streak starts over.
+                self.over.remove(peer);
+            }
+        }
+        self.link = status;
+    }
+
+    /// What is wrong with the link to one person, and the reading that says so.
+    pub fn trouble(&self, peer: PeerId) -> Option<(Trouble, PeerLink)> {
+        let link = *self.link.per_peer.get(&peer)?;
+        if link.relayed {
+            Some((Trouble::Relay, link))
+        } else if self.slow.contains(&peer) {
+            Some((Trouble::Slow, link))
+        } else {
+            None
+        }
+    }
+
+    /// The one link most worth naming: a relay before a slow direct link, the longer
+    /// round trip before the shorter, and the lower identity on a tie so the choice
+    /// holds still between readings.
+    pub fn worst_trouble(&self) -> Option<(PeerId, Trouble, PeerLink)> {
+        self.link
+            .per_peer
+            .keys()
+            .filter_map(|&peer| self.trouble(peer).map(|(kind, link)| (peer, kind, link)))
+            .max_by(|a, b| {
+                let relay = |kind: Trouble| kind == Trouble::Relay;
+                relay(a.1)
+                    .cmp(&relay(b.1))
+                    .then(a.2.rtt.cmp(&b.2.rtt))
+                    .then(b.0.cmp(&a.0))
+            })
     }
 
     /// Takes the engine's running dropout count and notes when it last moved.
@@ -1629,5 +1712,144 @@ mod tests {
             app.scroll_offset, 0,
             "switching channel must reset scroll offset"
         );
+    }
+
+    use crate::net::voice::PeerLink;
+    use std::time::Duration;
+
+    /// A room of four: us (1) and three others in general.
+    fn crowd() -> App {
+        let mut app = welcomed();
+        app.apply(Event::Roster(vec![
+            peer(1, Some(ChannelId(0))),
+            peer(2, Some(ChannelId(0))),
+            peer(3, Some(ChannelId(0))),
+            peer(4, Some(ChannelId(0))),
+        ]));
+        app
+    }
+
+    fn links(app: &mut App, readings: &[(u8, bool, u64)]) {
+        let per_peer = readings
+            .iter()
+            .map(|&(seed, relayed, ms)| {
+                (
+                    PeerId([seed; 32]),
+                    PeerLink {
+                        relayed,
+                        rtt: Duration::from_millis(ms),
+                    },
+                )
+            })
+            .collect();
+        app.take_link(LinkStatus {
+            per_peer,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn one_slow_reading_marks_nobody() {
+        let mut app = crowd();
+        let bob = PeerId([2; 32]);
+        links(&mut app, &[(2, false, 149)]);
+        assert_eq!(app.trouble(bob).map(|t| t.0), None);
+        links(&mut app, &[(2, false, 150)]);
+        assert_eq!(
+            app.trouble(bob).map(|t| t.0),
+            None,
+            "one spike is not a slow link"
+        );
+        links(&mut app, &[(2, false, 60)]);
+        links(&mut app, &[(2, false, 200)]);
+        assert_eq!(
+            app.trouble(bob).map(|t| t.0),
+            None,
+            "a dip in between starts the count again"
+        );
+        links(&mut app, &[(2, false, 200)]);
+        assert_eq!(
+            app.trouble(bob).map(|t| t.0),
+            Some(Trouble::Slow),
+            "the second in a row marks them"
+        );
+    }
+
+    #[test]
+    fn a_slow_link_holds_inside_the_band_and_clears_under_120ms() {
+        let mut app = crowd();
+        let bob = PeerId([2; 32]);
+        links(&mut app, &[(2, false, 150)]);
+        links(&mut app, &[(2, false, 150)]);
+        links(&mut app, &[(2, false, 130)]);
+        assert_eq!(
+            app.trouble(bob).map(|t| t.0),
+            Some(Trouble::Slow),
+            "inside the band it holds"
+        );
+        links(&mut app, &[(2, false, 119)]);
+        assert_eq!(app.trouble(bob).map(|t| t.0), None);
+    }
+
+    #[test]
+    fn a_relay_is_trouble_however_fast() {
+        let mut app = crowd();
+        links(&mut app, &[(2, true, 20)]);
+        assert_eq!(
+            app.trouble(PeerId([2; 32])).map(|t| t.0),
+            Some(Trouble::Relay)
+        );
+    }
+
+    #[test]
+    fn a_relay_outranks_a_slower_direct_link() {
+        let mut app = crowd();
+        links(&mut app, &[(3, false, 400), (4, true, 200)]);
+        links(&mut app, &[(3, false, 400), (4, true, 200)]);
+        let (who, kind, link) = app.worst_trouble().unwrap();
+        assert_eq!((who, kind), (PeerId([4; 32]), Trouble::Relay));
+        assert_eq!(link.rtt, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn equal_troubles_pick_the_same_person_every_tick() {
+        let mut app = crowd();
+        links(&mut app, &[(4, true, 200), (3, true, 200)]);
+        assert_eq!(app.worst_trouble().unwrap().0, PeerId([3; 32]));
+    }
+
+    #[test]
+    fn a_peer_that_drops_off_the_link_is_forgotten() {
+        let mut app = crowd();
+        let bob = PeerId([2; 32]);
+        links(&mut app, &[(2, false, 200)]);
+        links(&mut app, &[(2, false, 200)]);
+        links(&mut app, &[]);
+        assert_eq!(app.trouble(bob), None);
+        links(&mut app, &[(2, false, 130)]);
+        assert_eq!(
+            app.trouble(bob),
+            None,
+            "back after leaving, they start clean"
+        );
+    }
+
+    #[test]
+    fn a_link_to_someone_who_left_is_dropped() {
+        let mut app = crowd();
+        links(&mut app, &[(2, false, 18), (9, true, 300)]);
+        assert!(
+            !app.link.per_peer.contains_key(&PeerId([9; 32])),
+            "nobody may read a stranger's link"
+        );
+        assert_eq!(app.trouble(PeerId([9; 32])), None);
+        assert_eq!(app.worst_trouble(), None);
+    }
+
+    #[test]
+    fn a_healthy_room_has_no_trouble() {
+        let mut app = crowd();
+        links(&mut app, &[(2, false, 18), (3, false, 40)]);
+        assert_eq!(app.worst_trouble(), None);
     }
 }
