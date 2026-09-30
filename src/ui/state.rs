@@ -12,8 +12,6 @@ use crate::net::Event;
 use crate::net::voice::LinkStatus;
 use crate::proto::{ChannelId, ChatLine, PeerId, PeerInfo};
 
-
-
 /// How long a dropout keeps being reported after the audio recovers.
 const DROPOUT_MEMORY: std::time::Duration = std::time::Duration::from_secs(6);
 
@@ -550,8 +548,7 @@ impl App {
         if self.mic_test == MicTest::Off {
             self.fed_back = false;
             self.mic_test = MicTest::Recording;
-            self.mic_test_until =
-                Some(std::time::Instant::now() + crate::audio::TEST_LENGTH);
+            self.mic_test_until = Some(std::time::Instant::now() + crate::audio::TEST_LENGTH);
         } else {
             self.stop_mic_test();
         }
@@ -650,7 +647,10 @@ impl App {
     /// The sound a key should make, or nothing when the user has asked for quiet.
     pub fn click_for(&self, key: char) -> Option<crate::audio::blip::Blip> {
         (self.typing_clicks && self.typing_volume > 0.0).then_some(
-            crate::audio::blip::Blip::Click { key, volume: self.typing_volume },
+            crate::audio::blip::Blip::Click {
+                key,
+                volume: self.typing_volume,
+            },
         )
     }
 
@@ -705,7 +705,9 @@ impl App {
                     if let Some(idx) = self.input_devices.iter().position(|d| d.name == *active) {
                         self.selected_input_idx = idx;
                     }
-                } else if let Some(default_idx) = self.input_devices.iter().position(|d| d.is_default) {
+                } else if let Some(default_idx) =
+                    self.input_devices.iter().position(|d| d.is_default)
+                {
                     self.selected_input_idx = default_idx;
                 }
                 if self.selected_input_idx >= self.input_devices.len() {
@@ -721,7 +723,9 @@ impl App {
                     if let Some(idx) = self.output_devices.iter().position(|d| d.name == *active) {
                         self.selected_output_idx = idx;
                     }
-                } else if let Some(default_idx) = self.output_devices.iter().position(|d| d.is_default) {
+                } else if let Some(default_idx) =
+                    self.output_devices.iter().position(|d| d.is_default)
+                {
                     self.selected_output_idx = default_idx;
                 }
                 if self.selected_output_idx >= self.output_devices.len() {
@@ -912,12 +916,24 @@ mod tests {
             peer(2, Some(ChannelId(1))),
         ]));
 
-        assert_eq!(app.voice, Some(ChannelId(2)), "the voice channel comes from the roster");
-        assert_eq!(app.viewing, ChannelId(0), "the viewed channel must not change");
+        assert_eq!(
+            app.voice,
+            Some(ChannelId(2)),
+            "the voice channel comes from the roster"
+        );
+        assert_eq!(
+            app.viewing,
+            ChannelId(0),
+            "the viewed channel must not change"
+        );
 
         app.view_next(true);
         assert_eq!(app.viewing, ChannelId(1));
-        assert_eq!(app.voice, Some(ChannelId(2)), "browsing must not move the voice channel");
+        assert_eq!(
+            app.voice,
+            Some(ChannelId(2)),
+            "browsing must not move the voice channel"
+        );
     }
 
     #[test]
@@ -933,7 +949,10 @@ mod tests {
 
         app.view_next(true);
         assert_eq!(app.viewing, ChannelId(1));
-        assert!(app.unread.is_empty(), "looking at a channel is what reading it means");
+        assert!(
+            app.unread.is_empty(),
+            "looking at a channel is what reading it means"
+        );
     }
 
     #[test]
@@ -953,7 +972,10 @@ mod tests {
             text: "mine".into(),
             at: 2,
         }));
-        assert!(app.unread.is_empty(), "you do not need telling about your own message");
+        assert!(
+            app.unread.is_empty(),
+            "you do not need telling about your own message"
+        );
     }
 
     #[test]
@@ -965,7 +987,11 @@ mod tests {
         assert!(app.click_for('a').is_some());
 
         app.nudge_typing_volume(-1.0);
-        assert_eq!(app.click_for('a'), None, "turned all the way down is off too");
+        assert_eq!(
+            app.click_for('a'),
+            None,
+            "turned all the way down is off too"
+        );
     }
 
     #[test]
@@ -992,12 +1018,24 @@ mod tests {
         assert_eq!(seen.len(), 4);
         seen.sort_by_key(|section| format!("{section:?}"));
         seen.dedup();
-        assert_eq!(seen.len(), 4, "tab must reach all four, not loop through three");
+        assert_eq!(
+            seen.len(),
+            4,
+            "tab must reach all four, not loop through three"
+        );
 
         app.settings_next_section(true);
-        assert_eq!(app.settings_section, SettingsSection::InputDevice, "and wrap");
+        assert_eq!(
+            app.settings_section,
+            SettingsSection::InputDevice,
+            "and wrap"
+        );
         app.settings_next_section(false);
-        assert_eq!(app.settings_section, SettingsSection::Typing, "in both directions");
+        assert_eq!(
+            app.settings_section,
+            SettingsSection::Typing,
+            "in both directions"
+        );
     }
 
     #[test]
@@ -1054,7 +1092,10 @@ mod tests {
         assert_eq!(app.peers_in(ChannelId(1)).len(), 1);
         assert_eq!(app.peers_in(ChannelId(0)).len(), 0);
 
-        app.apply(Event::Roster(vec![peer(1, Some(ChannelId(0))), peer(2, None)]));
+        app.apply(Event::Roster(vec![
+            peer(1, Some(ChannelId(0))),
+            peer(2, None),
+        ]));
         assert_eq!(app.peers_in(ChannelId(0)).len(), 1);
         assert_eq!(app.peers_in(ChannelId(1)).len(), 0);
     }
@@ -1096,18 +1137,29 @@ mod tests {
         );
 
         app.dropped_at = Some(std::time::Instant::now() - DROPOUT_MEMORY * 2);
-        assert!(!app.recently_dropped(), "old trouble must stop being reported");
+        assert!(
+            !app.recently_dropped(),
+            "old trouble must stop being reported"
+        );
     }
 
     #[test]
     fn the_recorded_test_keeps_the_speaker_shut_while_the_microphone_is_open() {
         let mut app = welcomed();
         app.toggle_recorded_test();
-        assert_eq!(app.mic_test, MicTest::Recording, "recording comes first, on its own");
+        assert_eq!(
+            app.mic_test,
+            MicTest::Recording,
+            "recording comes first, on its own"
+        );
 
         app.mic_test_until = Some(std::time::Instant::now());
         assert!(app.advance_mic_test());
-        assert_eq!(app.mic_test, MicTest::Playing, "and only then does the speaker open");
+        assert_eq!(
+            app.mic_test,
+            MicTest::Playing,
+            "and only then does the speaker open"
+        );
 
         app.mic_test_until = Some(std::time::Instant::now());
         assert!(app.advance_mic_test());
@@ -1130,10 +1182,16 @@ mod tests {
         app.toggle_monitor();
         assert_eq!(app.mic_test, MicTest::Monitoring);
 
-        assert!(!app.watch_for_feedback(1.0), "one loud frame is not yet a verdict");
+        assert!(
+            !app.watch_for_feedback(1.0),
+            "one loud frame is not yet a verdict"
+        );
         app.loud_since = Some(std::time::Instant::now() - RUNAWAY_FOR * 2);
 
-        assert!(app.watch_for_feedback(1.0), "but a level that never comes down is");
+        assert!(
+            app.watch_for_feedback(1.0),
+            "but a level that never comes down is"
+        );
         assert_eq!(app.mic_test, MicTest::Off);
         assert!(app.fed_back, "and the interface has to be able to say why");
     }
@@ -1168,12 +1226,18 @@ mod tests {
         for _ in 0..100 {
             app.nudge_gate(-0.05);
         }
-        assert_eq!(app.input_gate, 0.0, "the bottom of the meter means never gate");
+        assert_eq!(
+            app.input_gate, 0.0,
+            "the bottom of the meter means never gate"
+        );
 
         for _ in 0..100 {
             app.nudge_gate(0.05);
         }
-        assert_eq!(app.input_gate, GATE_CEILING, "and it must never eat the voice entirely");
+        assert_eq!(
+            app.input_gate, GATE_CEILING,
+            "and it must never eat the voice entirely"
+        );
     }
 
     #[test]
@@ -1191,7 +1255,10 @@ mod tests {
     fn measuring_the_room_settles_above_the_loudest_thing_it_heard() {
         let mut app = welcomed();
         app.start_calibration();
-        assert!(app.needs_animation(), "a measurement has to keep the loop awake");
+        assert!(
+            app.needs_animation(),
+            "a measurement has to keep the loop awake"
+        );
         assert_eq!(app.finish_calibration(), None, "it is still listening");
 
         for level in [0.05, 0.22, 0.11] {
@@ -1201,7 +1268,10 @@ mod tests {
         app.calibrating.as_mut().unwrap().until = std::time::Instant::now();
 
         let gate = app.finish_calibration().expect("its time is up");
-        assert!((gate - (0.22 + CALIBRATION_MARGIN)).abs() < 1e-6, "settled at {gate}");
+        assert!(
+            (gate - (0.22 + CALIBRATION_MARGIN)).abs() < 1e-6,
+            "settled at {gate}"
+        );
         assert_eq!(app.input_gate, gate);
         assert!(app.calibrating.is_none(), "and it is over");
         assert_eq!(app.finish_calibration(), None, "it does not fire twice");
@@ -1252,13 +1322,19 @@ mod tests {
     #[test]
     fn a_still_room_asks_for_no_redraws() {
         let mut app = welcomed();
-        assert!(!app.needs_animation(), "nothing is moving, so nothing should wake the loop");
+        assert!(
+            !app.needs_animation(),
+            "nothing is moving, so nothing should wake the loop"
+        );
 
         app.speaking.insert(PeerId([2; 32]));
         assert!(app.needs_animation(), "a travelling pulse needs frames");
 
         app.motion = false;
-        assert!(!app.needs_animation(), "reduced motion must stop the frames, not just the pulse");
+        assert!(
+            !app.needs_animation(),
+            "reduced motion must stop the frames, not just the pulse"
+        );
     }
 
     #[test]
@@ -1282,7 +1358,10 @@ mod tests {
     fn push_to_talk_keeps_the_microphone_shut_until_pressed() {
         let mut app = welcomed();
         app.ptt_mode = true;
-        assert!(!app.mic_open(), "nothing may be transmitted before the key is pressed");
+        assert!(
+            !app.mic_open(),
+            "nothing may be transmitted before the key is pressed"
+        );
 
         app.ptt_active = true;
         assert!(app.mic_open());
@@ -1546,7 +1625,9 @@ mod tests {
         assert_eq!(app.scroll_offset, 4);
 
         app.view_next(true);
-        assert_eq!(app.scroll_offset, 0, "switching channel must reset scroll offset");
+        assert_eq!(
+            app.scroll_offset, 0,
+            "switching channel must reset scroll offset"
+        );
     }
 }
-

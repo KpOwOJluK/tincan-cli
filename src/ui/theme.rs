@@ -240,7 +240,13 @@ impl Theme {
     /// The narrowest terminal tincan supports: no colour, no glyph outside ASCII, no
     /// motion. The tests draw against this to keep the fallback honest.
     pub fn austere() -> Self {
-        Self { palette: MONO, glyphs: ASCII, motion: false, mono: true, ascii: true }
+        Self {
+            palette: MONO,
+            glyphs: ASCII,
+            motion: false,
+            mono: true,
+            ascii: true,
+        }
     }
 
     /// Swaps marks that live in prose rather than in the glyph table.
@@ -270,7 +276,9 @@ impl Theme {
     }
 
     pub fn strong(&self) -> Style {
-        Style::default().fg(self.palette.tin).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.palette.tin)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn dim(&self) -> Style {
@@ -412,7 +420,11 @@ mod tests {
             let mut seen = glyphs.strand.to_vec();
             seen.sort_unstable();
             seen.dedup();
-            assert_eq!(seen.len(), 4, "a state that looks like another reports nothing");
+            assert_eq!(
+                seen.len(),
+                4,
+                "a state that looks like another reports nothing"
+            );
         }
     }
 
@@ -442,39 +454,77 @@ mod tests {
 
     #[test]
     fn the_two_greens_stay_apart() {
-        let theme = Theme { palette: DARK_TRUE, glyphs: UNICODE, motion: true, mono: false, ascii: false };
+        let theme = Theme {
+            palette: DARK_TRUE,
+            glyphs: UNICODE,
+            motion: true,
+            mono: false,
+            ascii: false,
+        };
         assert_ne!(
             theme.accent().fg,
             theme.ok().fg,
             "what is active and what is holding are different questions"
         );
-        assert_ne!(theme.meter(4).1.fg, theme.meter(2).1.fg, "a hot meter must look hot");
+        assert_ne!(
+            theme.meter(4).1.fg,
+            theme.meter(2).1.fg,
+            "a hot meter must look hot"
+        );
     }
 
     #[test]
     fn the_meter_runs_from_quiet_to_loud() {
-        let theme = Theme { palette: DARK_TRUE, glyphs: UNICODE, motion: true, mono: false, ascii: false };
+        let theme = Theme {
+            palette: DARK_TRUE,
+            glyphs: UNICODE,
+            motion: true,
+            mono: false,
+            ascii: false,
+        };
         let (quiet, _) = theme.meter(0);
         let (loud, _) = theme.meter(4);
         assert_ne!(quiet, loud);
-        assert_eq!(theme.meter(9).0, loud, "an out-of-range level must not panic");
+        assert_eq!(
+            theme.meter(9).0,
+            loud,
+            "an out-of-range level must not panic"
+        );
     }
 
     #[test]
     fn every_meter_step_is_the_same_width() {
         for glyphs in [&UNICODE, &ASCII] {
             for step in glyphs.meter {
-                assert_eq!(step.chars().count(), 3, "the meter must not shift the name beside it");
+                assert_eq!(
+                    step.chars().count(),
+                    3,
+                    "the meter must not shift the name beside it"
+                );
             }
         }
     }
 
     #[test]
     fn no_color_keeps_the_distinctions_without_hue() {
-        let theme = Theme { palette: MONO, glyphs: UNICODE, motion: true, mono: true, ascii: false };
+        let theme = Theme {
+            palette: MONO,
+            glyphs: UNICODE,
+            motion: true,
+            mono: true,
+            ascii: false,
+        };
         assert_ne!(theme.dim(), theme.text(), "dim must stay distinguishable");
-        assert_ne!(theme.chip(), theme.text(), "a chip must stay distinguishable");
-        assert_eq!(theme.text().fg, Some(Color::Reset), "no colour may be forced");
+        assert_ne!(
+            theme.chip(),
+            theme.text(),
+            "a chip must stay distinguishable"
+        );
+        assert_eq!(
+            theme.text().fg,
+            Some(Color::Reset),
+            "no colour may be forced"
+        );
     }
 
     #[test]
@@ -489,8 +539,18 @@ mod tests {
         assert!(plain.glyphs.cut.is_ascii());
         assert!(plain.glyphs.dot.is_ascii());
 
-        let full = Theme { palette: DARK_TRUE, glyphs: UNICODE, motion: true, mono: false, ascii: false };
-        assert_eq!(full.plainly("tab · f2"), "tab · f2", "a capable terminal keeps the mark");
+        let full = Theme {
+            palette: DARK_TRUE,
+            glyphs: UNICODE,
+            motion: true,
+            mono: false,
+            ascii: false,
+        };
+        assert_eq!(
+            full.plainly("tab · f2"),
+            "tab · f2",
+            "a capable terminal keeps the mark"
+        );
     }
 
     #[test]
