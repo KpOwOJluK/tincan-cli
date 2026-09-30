@@ -59,6 +59,9 @@ pub struct Glyphs {
     pub note: char,
     /// The mark that says a name or a message was cut to fit.
     pub cut: char,
+    /// Marks a round trip that goes through a relay. The same broken line the slack
+    /// string is drawn with, so the roster and the string say it the same way.
+    pub relay: char,
     /// The separator between two facts sharing a line.
     pub dot: &'static str,
     pub can: CanArt,
@@ -75,6 +78,7 @@ const UNICODE: Glyphs = Glyphs {
     caret: '▏',
     note: '·',
     cut: '…',
+    relay: '╌',
     dot: " · ",
     can: CanArt {
         lid: "( o )",
@@ -97,6 +101,7 @@ const ASCII: Glyphs = Glyphs {
     caret: '_',
     note: '-',
     cut: '~',
+    relay: ':',
     dot: " - ",
     can: CanArt {
         lid: "( o )",
@@ -432,7 +437,7 @@ mod tests {
     fn the_ascii_fallback_is_actually_ascii() {
         let art = &ASCII.can;
         let text = format!(
-            "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             ASCII.strand.iter().collect::<String>(),
             ASCII.pulse,
             ASCII.cursor,
@@ -442,6 +447,7 @@ mod tests {
             ASCII.caret,
             ASCII.note,
             ASCII.cut,
+            ASCII.relay,
             ASCII.dot,
             art.lid,
             art.top,
@@ -450,6 +456,15 @@ mod tests {
             [art.string, art.knot].iter().collect::<String>(),
         );
         assert!(text.is_ascii(), "not ascii: {text}");
+    }
+
+    #[test]
+    fn the_relay_mark_is_not_the_cut_mark() {
+        assert_ne!(
+            ASCII.relay, ASCII.cut,
+            "a relayed link must not read as a clipped word"
+        );
+        assert_ne!(UNICODE.relay, UNICODE.cut);
     }
 
     #[test]

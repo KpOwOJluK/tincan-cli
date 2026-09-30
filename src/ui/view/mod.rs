@@ -192,6 +192,15 @@ fn spread(width: u16, left: Vec<Span<'static>>, right: Vec<Span<'static>>) -> Te
     TextLine::from(spans)
 }
 
+/// A round trip as the interface writes it everywhere. Past a second the exact figure
+/// stops mattering and would not fit the roster, so it is capped rather than cut.
+fn millis(rtt: std::time::Duration) -> String {
+    match rtt.as_millis() {
+        ms @ 0..=999 => format!("{ms}ms"),
+        _ => ">999ms".to_string(),
+    }
+}
+
 /// Cuts to width, with an ellipsis when something was lost.
 fn clip(text: &str, width: usize, theme: &Theme) -> String {
     if text.chars().count() <= width {
@@ -414,6 +423,14 @@ mod tests {
         assert!(fit(&app, 40, &theme).chars().count() <= 40);
         assert!(fit(&app, 12, &theme).chars().count() <= 12);
         assert!(fit(&app, 3, &theme).chars().count() <= 3);
+    }
+    #[test]
+    fn millis_caps_at_999() {
+        use std::time::Duration;
+        assert_eq!(millis(Duration::from_millis(340)), "340ms");
+        assert_eq!(millis(Duration::from_millis(999)), "999ms");
+        assert_eq!(millis(Duration::from_millis(1000)), ">999ms");
+        assert_eq!(millis(Duration::from_secs(120)), ">999ms");
     }
 }
 
