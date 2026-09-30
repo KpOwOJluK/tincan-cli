@@ -1250,9 +1250,10 @@ mod pictures {
     /// The Ratatui showcase recording: the terminal alone, as VHS would capture it.
     ///
     /// No window, no camera, nothing zooming — the showcase asks for calm motion and
-    /// the subject filling the frame. What moves is the interface: someone joins, the
-    /// string pulls taut, a voice travels down it, the link falls back to a relay and
-    /// sags, the audio breaks up and it frays, and the audio screen opens over it.
+    /// the subject filling the frame. What moves is the interface: people join, the
+    /// string pulls taut, a voice travels down it, one person's link falls back to a
+    /// relay — the string sags and the roster, header and far can all name him — the
+    /// audio breaks up and it frays, naming nobody, and the audio screen opens over it.
     /// Written under `target/` because the showcase asks for media to live outside
     /// the repository.
     ///
@@ -1288,12 +1289,30 @@ mod pictures {
         let theme = Theme::dark_true();
         let me = PeerId([1; 32]);
         let bob = PeerId([2; 32]);
-        let direct = |rtt: u64, peers: usize| crate::net::voice::LinkStatus {
-            direct: peers,
-            relayed: 0,
-            worst_rtt: (peers > 0).then(|| std::time::Duration::from_millis(rtt)),
-            ..Default::default()
+        let deniz = PeerId([4; 32]);
+        // One reading of the mesh: (who, through a relay, round trip in ms).
+        let links = |readings: &[(u8, bool, u64)]| {
+            let per_peer: std::collections::BTreeMap<_, _> = readings
+                .iter()
+                .map(|&(seed, relayed, ms)| {
+                    let rtt = std::time::Duration::from_millis(ms);
+                    (
+                        PeerId([seed; 32]),
+                        crate::net::voice::PeerLink { relayed, rtt },
+                    )
+                })
+                .collect();
+            crate::net::voice::LinkStatus {
+                direct: per_peer.values().filter(|l| !l.relayed).count(),
+                relayed: per_peer.values().filter(|l| l.relayed).count(),
+                worst_rtt: per_peer.values().map(|l| l.rtt).max(),
+                per_peer,
+            }
         };
+        let healthy = [(2, false, 18), (3, false, 24), (4, false, 31)];
+        // Deniz drops to a relay; everyone else stays direct, so the header, the far
+        // can and his row in the roster all have to agree on who it is.
+        let relayed = [(2, false, 18), (3, false, 24), (4, true, 140)];
 
         let mut app = App::new(
             me,
@@ -1311,7 +1330,6 @@ mod pictures {
         app.voice = Some(ChannelId(0));
         app.voice_available = true;
         app.motion = true;
-        app.link = direct(0, 0);
         app.active_input_name = Some("MacBook Pro Microphone".into());
         app.active_output_name = Some("AirPods Pro".into());
         app.input_gate = 0.23;
@@ -1348,32 +1366,27 @@ mod pictures {
                     app.apply(Event::Roster(vec![
                         peer(1, "alice", Some(ChannelId(0))),
                         peer(2, "bob", Some(ChannelId(0))),
-                        peer(3, "cem", Some(ChannelId(1))),
+                        peer(3, "cem", Some(ChannelId(0))),
+                        peer(4, "deniz", Some(ChannelId(0))),
+                        peer(5, "jack", Some(ChannelId(1))),
                     ]));
-                    app.link = direct(18, 2);
+                    app.take_link(links(&healthy));
                 }
                 BOB_SAYS => say(&mut app, bob, "hey, can you hear me alright?", 0),
                 SEND => {
                     say(&mut app, me, reply, 40);
                     app.input.clear();
                 }
-                RELAY => {
-                    app.link = crate::net::voice::LinkStatus {
-                        direct: 1,
-                        relayed: 1,
-                        worst_rtt: Some(std::time::Duration::from_millis(140)),
-                        ..Default::default()
-                    };
-                }
+                RELAY => app.take_link(links(&relayed)),
                 RELAY_SAYS => say(
                     &mut app,
-                    bob,
+                    deniz,
                     "on hotel wifi now, coming through a relay",
                     95,
                 ),
                 MEND => {
                     app.dropped_at = None;
-                    app.link = direct(18, 2);
+                    app.take_link(links(&healthy));
                 }
                 SETTINGS => {
                     app.view_mode = ViewMode::Settings;
@@ -1383,13 +1396,21 @@ mod pictures {
                 _ => {}
             }
 
-            // Bob talks over the taut string, then again over the relay and the fray —
+            // Bob talks over the taut string, then deniz over the relay and the fray —
             // the pulse slows down with the round trip.
-            let talking = (TALK..TYPE).contains(&f) || (RELAY_SAYS..MEND).contains(&f);
-            if talking {
-                app.speaking.insert(bob);
+            let talker = if (TALK..TYPE).contains(&f) {
+                Some(bob)
+            } else if (RELAY_SAYS..MEND).contains(&f) {
+                Some(deniz)
+            } else {
+                None
+            };
+            if let Some(talker) = talker {
+                app.speaking.clear();
+                app.peer_levels.clear();
+                app.speaking.insert(talker);
                 let level = [2, 4, 3, 5, 3, 1, 4, 2][(f / 3) % 8];
-                app.peer_levels.insert(bob, level);
+                app.peer_levels.insert(talker, level);
             } else {
                 app.speaking.clear();
                 app.peer_levels.clear();
