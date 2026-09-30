@@ -9,9 +9,9 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use super::{clip, spread};
+use super::{clip, millis, spread};
 use crate::proto::ChannelId;
-use crate::ui::state::{App, ViewMode};
+use crate::ui::state::{App, Trouble, ViewMode};
 use crate::ui::theme::Theme;
 
 /// The rail only names the audio hardware when there is room to spare for it.
@@ -19,7 +19,7 @@ const AUDIO_NEEDS: u16 = 14;
 /// A chip row plus the blank line under the section.
 const CHROME_ROWS: u16 = 2;
 /// How much of a name the rail can hold before it has to cut it.
-const NAME_ROOM: usize = 12;
+pub(super) const NAME_ROOM: usize = 12;
 /// How much of the right-hand tag the rail can hold. Exactly wide enough for the two
 /// longest things it ever says — "deafened" and "silenced" — and no wider, because the
 /// column the cursor needs had to come from somewhere.
@@ -246,23 +246,41 @@ fn people_rows(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
             // are on that row moving it — the rest of the time the meter carries it
             // and the column goes back to answering where the person is, which is what
             // it is for.
-            let tag = if peer.deafened {
-                "deafened".to_string()
+            //
+            // A link in trouble comes next: it is what explains why someone sounds
+            // wrong, which matters more than idling or where they sit. Brass is the
+            // colour the slack string already uses for a relay. On the row you are on,
+            // a healthy link reads as its number, the way a volume does.
+            let (tag, tag_style) = if peer.deafened {
+                ("deafened".to_string(), theme.dim())
             } else if peer.muted {
-                "muted".to_string()
+                ("muted".to_string(), theme.dim())
             } else if gain == 0.0 {
-                "silenced".to_string()
+                ("silenced".to_string(), theme.dim())
             } else if selected && gain != 1.0 {
-                format!("{}%", (gain * 100.0).round())
+                (format!("{}%", (gain * 100.0).round()), theme.dim())
+            } else if let Some((kind, link)) = app.trouble(peer.id) {
+                match kind {
+                    Trouble::Relay => (
+                        format!("{}{}", theme.glyphs.relay, millis(link.rtt)),
+                        theme.brass(),
+                    ),
+                    Trouble::Slow => (millis(link.rtt), theme.text()),
+                }
+            } else if let Some(link) = app.link.per_peer.get(&peer.id).filter(|_| selected) {
+                (millis(link.rtt), theme.dim())
             } else if peer.afk {
-                "afk".to_string()
+                ("afk".to_string(), theme.dim())
             } else {
-                peer.channel
-                    .map(|channel| app.channel_name(channel).to_string())
-                    .unwrap_or_default()
+                (
+                    peer.channel
+                        .map(|channel| app.channel_name(channel).to_string())
+                        .unwrap_or_default(),
+                    theme.dim(),
+                )
             };
             let right = vec![
-                Span::styled(clip(&tag, TAG_ROOM, theme), theme.dim()),
+                Span::styled(clip(&tag, TAG_ROOM, theme), tag_style),
                 Span::raw(" "),
             ];
             spread(width, left, right)
@@ -737,6 +755,134 @@ mod tests {
             text(&rows[0]).contains("system default"),
             "{}",
             text(&rows[0])
+        );
+    }
+
+    use crate::net::voice::{LinkStatus, PeerLink};
+    use std::time::Duration;
+
+    /// `room()` plus cem, in general, who is neither muted nor deafened.
+    fn with_cem() -> App {
+        let mut app = room();
+        app.peers.push(PeerInfo {
+            id: PeerId([3; 32]),
+            name: "cem".into(),
+            channel: Some(ChannelId(0)),
+            muted: false,
+            deafened: false,
+            afk: false,
+        });
+        // Links are only kept for people in the call we are in.
+        app.voice = Some(ChannelId(0));
+        app
+    }
+
+    fn links(app: &mut App, readings: &[(u8, bool, u64)]) {
+        let per_peer = readings
+            .iter()
+            .map(|&(seed, relayed, ms)| {
+                (
+                    PeerId([seed; 32]),
+                    PeerLink {
+                        relayed,
+                        rtt: Duration::from_millis(ms),
+                    },
+                )
+            })
+            .collect();
+        app.take_link(LinkStatus {
+            per_peer,
+            ..Default::default()
+        });
+    }
+
+    fn cem_row(app: &App, theme: &Theme) -> TextLine<'static> {
+        let rows = people_rows(28, app, theme);
+        assert!(
+            rows.iter().all(|row| row.width() <= 28),
+            "a roster row overflowed"
+        );
+        rows[2].clone()
+    }
+
+    #[test]
+    fn a_relayed_peer_shows_their_round_trip_in_brass() {
+        let theme = Theme::dark_true();
+        let mut app = with_cem();
+        links(&mut app, &[(3, true, 340)]);
+        let row = cem_row(&app, &theme);
+        let tag = row
+            .spans
+            .iter()
+            .find(|span| span.content.contains("340ms"))
+            .expect("no ms tag");
+        assert!(tag.content.contains(theme.glyphs.relay), "{}", text(&row));
+        assert_eq!(tag.style, theme.brass());
+    }
+
+    #[test]
+    fn a_slow_direct_peer_shows_their_round_trip() {
+        let theme = Theme::dark_true();
+        let mut app = with_cem();
+        links(&mut app, &[(3, false, 190)]);
+        links(&mut app, &[(3, false, 190)]); // slow takes two readings in a row
+        let row = cem_row(&app, &theme);
+        let tag = row
+            .spans
+            .iter()
+            .find(|span| span.content.contains("190ms"))
+            .expect("no ms tag");
+        assert!(!tag.content.contains(theme.glyphs.relay));
+        assert_eq!(tag.style, theme.text());
+    }
+
+    #[test]
+    fn being_muted_says_more_than_a_bad_link() {
+        let theme = Theme::dark_true();
+        let mut app = with_cem();
+        app.peers[2].muted = true;
+        links(&mut app, &[(3, true, 340)]);
+        let row = cem_row(&app, &theme);
+        assert!(text(&row).contains("muted"), "{}", text(&row));
+        assert!(!text(&row).contains("340ms"), "{}", text(&row));
+    }
+
+    #[test]
+    fn a_healthy_peer_keeps_their_channel_until_you_pick_them() {
+        let theme = Theme::dark_true();
+        let mut app = with_cem();
+        links(&mut app, &[(3, false, 18)]);
+        assert!(text(&cem_row(&app, &theme)).contains("general"));
+
+        app.selected_peer = Some(PeerId([3; 32]));
+        assert!(text(&cem_row(&app, &theme)).contains("18ms"));
+
+        app.peer_gains.insert(PeerId([3; 32]), 0.5);
+        assert!(
+            text(&cem_row(&app, &theme)).contains("50%"),
+            "moving the volume shows the volume"
+        );
+    }
+
+    #[test]
+    fn someone_without_a_link_keeps_their_channel() {
+        let theme = Theme::dark_true();
+        let mut app = with_cem();
+        app.selected_peer = Some(PeerId([3; 32]));
+        links(&mut app, &[]);
+        assert!(text(&cem_row(&app, &theme)).contains("general"));
+    }
+
+    #[test]
+    fn a_huge_round_trip_still_fits_the_rail() {
+        let theme = Theme::dark_true();
+        let mut app = with_cem();
+        links(&mut app, &[(3, true, 123_456)]);
+        let row = cem_row(&app, &theme); // asserts every row ≤ 28 cells
+        assert!(
+            text(&row).contains(">999ms"),
+            "a capped number, never a cut one: {}",
+            text(&row)
         );
     }
 }

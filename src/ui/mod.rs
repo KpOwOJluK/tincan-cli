@@ -301,7 +301,7 @@ pub async fn run(mut session: Session, voice: Option<VoiceControl>, ptt_mode: bo
                         let _ = session.commands.send(Command::SetAfk(true)).await;
                     }
                     if let Some(voice) = voice.as_ref() {
-                        app.link = voice.mesh.link_status().await;
+                        app.take_link(voice.mesh.link_status().await);
                         app.note_dropouts(voice.health.underruns());
 
                         // The first tick is the earliest point the roster has landed,

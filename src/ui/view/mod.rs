@@ -102,19 +102,54 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
     }
 
+    // The chip summarises the room. When more than one person is on the line and one
+    // of them is the problem, it says who, so that a terminal too narrow for the
+    // roster still answers the question. If that does not fit, the name goes first,
+    // then the number.
     let strand = strand::of(app);
-    let mut right = Vec::new();
+    let named = if app.link.peers() >= 2 {
+        named_trouble(app)
+    } else {
+        None
+    };
+    let who = named.and_then(|(id, _, link)| {
+        app.peers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.name.clone(), link.rtt))
+    });
+    let rtt = who.as_ref().map(|(_, rtt)| *rtt).or(app.link.worst_rtt);
+
+    let mut base = Vec::new();
     if app.recently_dropped() {
-        right.push(Span::styled("audio dropping ", theme.error()));
+        base.push(Span::styled("audio dropping ", theme.error()));
     }
-    right.push(Span::styled(
+    base.push(Span::styled(
         format!(" {} ", strand::label(app)),
         theme.chip_link(strand),
     ));
-    if let Some(rtt) = app.link.worst_rtt {
-        right.push(Span::styled(format!(" {}ms", rtt.as_millis()), theme.dim()));
-    }
-    right.push(Span::raw(" "));
+    let name = who.map(|(name, _)| {
+        Span::styled(
+            format!("  {}", clip(&name, rail::NAME_ROOM, theme)),
+            theme.text(),
+        )
+    });
+    let number = rtt.map(|rtt| Span::styled(format!(" {}", millis(rtt)), theme.dim()));
+
+    let with = |parts: &[&Option<Span<'static>>]| {
+        let mut right = base.clone();
+        right.extend(parts.iter().filter_map(|part| (*part).clone()));
+        right.push(Span::raw(" "));
+        right
+    };
+    let fits = |right: &Vec<Span<'static>>| {
+        let used: usize = left.iter().chain(right.iter()).map(Span::width).sum();
+        used < area.width as usize
+    };
+    let right = [with(&[&name, &number]), with(&[&number])]
+        .into_iter()
+        .find(fits)
+        .unwrap_or_else(|| with(&[]));
 
     frame.render_widget(Paragraph::new(spread(area.width, left, right)), area);
 }
@@ -190,6 +225,31 @@ fn spread(width: u16, left: Vec<Span<'static>>, right: Vec<Span<'static>>) -> Te
         spans.extend(right);
     }
     TextLine::from(spans)
+}
+
+/// The link worth naming on screen, if any. While audio is breaking up nobody is
+/// named: a dropout is measured in our own playback and does not say whose audio was
+/// late, and a name beside `CHOPPY` would read as blame.
+fn named_trouble(
+    app: &App,
+) -> Option<(
+    crate::proto::PeerId,
+    crate::ui::state::Trouble,
+    crate::net::voice::PeerLink,
+)> {
+    if matches!(strand::of(app), crate::ui::theme::Strand::Frayed) {
+        return None;
+    }
+    app.worst_trouble()
+}
+
+/// A round trip as the interface writes it everywhere. Past a second the exact figure
+/// stops mattering and would not fit the roster, so it is capped rather than cut.
+fn millis(rtt: std::time::Duration) -> String {
+    match rtt.as_millis() {
+        ms @ 0..=999 => format!("{ms}ms"),
+        _ => ">999ms".to_string(),
+    }
 }
 
 /// Cuts to width, with an ellipsis when something was lost.
@@ -415,6 +475,187 @@ mod tests {
         assert!(fit(&app, 12, &theme).chars().count() <= 12);
         assert!(fit(&app, 3, &theme).chars().count() <= 3);
     }
+    #[test]
+    fn millis_caps_at_999() {
+        use std::time::Duration;
+        assert_eq!(millis(Duration::from_millis(340)), "340ms");
+        assert_eq!(millis(Duration::from_millis(999)), "999ms");
+        assert_eq!(millis(Duration::from_millis(1000)), ">999ms");
+        assert_eq!(millis(Duration::from_secs(120)), ">999ms");
+    }
+    use crate::net::voice::{LinkStatus, PeerLink};
+    use crate::proto::{ChannelId, PeerInfo};
+
+    /// Us plus `names`, all in general, with voice up and the given links (seed = index + 2).
+    fn call(names: &[&str], readings: &[(u8, bool, u64)]) -> App {
+        let mut app = room();
+        let person = |seed: u8, name: &str| PeerInfo {
+            id: PeerId([seed; 32]),
+            name: name.into(),
+            channel: Some(ChannelId(0)),
+            muted: false,
+            deafened: false,
+            afk: false,
+        };
+        app.peers = std::iter::once(person(1, "alice"))
+            .chain(
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| person(i as u8 + 2, name)),
+            )
+            .collect();
+        app.voice = Some(ChannelId(0));
+        app.voice_available = true;
+        let per_peer: std::collections::BTreeMap<_, _> = readings
+            .iter()
+            .map(|&(seed, relayed, ms)| {
+                (
+                    PeerId([seed; 32]),
+                    PeerLink {
+                        relayed,
+                        rtt: std::time::Duration::from_millis(ms),
+                    },
+                )
+            })
+            .collect();
+        app.take_link(LinkStatus {
+            direct: per_peer.values().filter(|l| !l.relayed).count(),
+            relayed: per_peer.values().filter(|l| l.relayed).count(),
+            worst_rtt: per_peer.values().map(|l| l.rtt).max(),
+            per_peer,
+        });
+        app
+    }
+
+    fn header(width: u16, app: &App) -> String {
+        rendered(width, 12, app).lines().next().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_two_person_call_keeps_the_header_it_has_today() {
+        let app = call(&["bob"], &[(2, true, 340)]);
+        let top = header(80, &app);
+        assert!(top.contains("RELAY") && top.contains("340ms"), "{top}");
+        assert!(
+            !top.contains("bob"),
+            "with one other person the name says nothing new: {top}"
+        );
+    }
+
+    #[test]
+    fn a_crowded_call_names_the_relayed_person() {
+        let app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        let top = header(80, &app);
+        assert!(
+            top.contains("RELAY") && top.contains("emre") && top.contains("340ms"),
+            "{top}"
+        );
+    }
+
+    #[test]
+    fn a_crowded_healthy_call_names_nobody() {
+        let app = call(&["bob", "cem"], &[(2, false, 18), (3, false, 31)]);
+        let top = header(80, &app);
+        assert!(top.contains("DIRECT") && top.contains("31ms"), "{top}");
+        assert!(!top.contains("bob") && !top.contains("cem"), "{top}");
+    }
+
+    #[test]
+    fn a_narrow_header_lets_the_name_go_before_the_number() {
+        let app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        let top = header(40, &app);
+        assert!(top.contains("RELAY") && top.contains("340ms"), "{top}");
+        assert!(!top.contains("emre"), "{top}");
+    }
+
+    #[test]
+    fn a_choppy_call_blames_nobody_in_the_header() {
+        let mut app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        app.dropped_at = Some(std::time::Instant::now());
+        let top = header(80, &app);
+        assert!(
+            top.contains("audio dropping") && top.contains("CHOPPY"),
+            "{top}"
+        );
+        assert!(
+            !top.contains("emre"),
+            "dropouts are not anyone's fault we can name: {top}"
+        );
+    }
+
+    #[test]
+    fn at_48_columns_the_whole_reading_fits() {
+        let app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        let top = header(48, &app);
+        assert!(
+            top.contains("RELAY") && top.contains("emre") && top.contains("340ms"),
+            "{top}"
+        );
+    }
+
+    #[test]
+    fn when_only_the_chip_fits_the_number_goes_too() {
+        let app = call(
+            &["bob", "cem", "deniz", "emre"],
+            &[
+                (2, false, 18),
+                (3, false, 22),
+                (4, false, 31),
+                (5, true, 340),
+            ],
+        );
+        let top = header(34, &app);
+        assert!(top.contains("RELAY"), "{top}");
+        assert!(!top.contains("340ms") && !top.contains("emre"), "{top}");
+    }
+
+    #[test]
+    fn a_long_name_is_cut_where_the_rail_cuts_it() {
+        let app = call(
+            &["bob", "bartholomew-the-great"],
+            &[(2, false, 18), (3, true, 340)],
+        );
+        let top = header(80, &app);
+        assert!(
+            top.contains("bartholomew"),
+            "cut at 12 like the rail: {top}"
+        );
+        assert!(!top.contains("bartholomew-the-great"), "{top}");
+        assert!(top.contains("340ms"), "{top}");
+    }
 }
 
 /// Regenerates the README's pictures from the real renderer.
@@ -604,6 +845,7 @@ mod pictures {
             direct: 2,
             relayed: 0,
             worst_rtt: Some(std::time::Duration::from_millis(18)),
+            ..Default::default()
         };
         app.active_input_name = Some("MacBook Pro Microphone".into());
         app.active_output_name = Some("AirPods Pro".into());
@@ -845,6 +1087,7 @@ mod pictures {
             direct: 2,
             relayed: 0,
             worst_rtt: Some(std::time::Duration::from_millis(18)),
+            ..Default::default()
         };
         app.active_input_name = Some("MacBook Pro Microphone".into());
         app.active_output_name = Some("AirPods Pro".into());
@@ -1041,9 +1284,10 @@ mod pictures {
     /// The Ratatui showcase recording: the terminal alone, as VHS would capture it.
     ///
     /// No window, no camera, nothing zooming — the showcase asks for calm motion and
-    /// the subject filling the frame. What moves is the interface: someone joins, the
-    /// string pulls taut, a voice travels down it, the link falls back to a relay and
-    /// sags, the audio breaks up and it frays, and the audio screen opens over it.
+    /// the subject filling the frame. What moves is the interface: people join, the
+    /// string pulls taut, a voice travels down it, one person's link falls back to a
+    /// relay — the string sags and the roster, header and far can all name him — the
+    /// audio breaks up and it frays, naming nobody, and the audio screen opens over it.
     /// Written under `target/` because the showcase asks for media to live outside
     /// the repository.
     ///
@@ -1079,11 +1323,30 @@ mod pictures {
         let theme = Theme::dark_true();
         let me = PeerId([1; 32]);
         let bob = PeerId([2; 32]);
-        let direct = |rtt: u64, peers: usize| crate::net::voice::LinkStatus {
-            direct: peers,
-            relayed: 0,
-            worst_rtt: (peers > 0).then(|| std::time::Duration::from_millis(rtt)),
+        let deniz = PeerId([4; 32]);
+        // One reading of the mesh: (who, through a relay, round trip in ms).
+        let links = |readings: &[(u8, bool, u64)]| {
+            let per_peer: std::collections::BTreeMap<_, _> = readings
+                .iter()
+                .map(|&(seed, relayed, ms)| {
+                    let rtt = std::time::Duration::from_millis(ms);
+                    (
+                        PeerId([seed; 32]),
+                        crate::net::voice::PeerLink { relayed, rtt },
+                    )
+                })
+                .collect();
+            crate::net::voice::LinkStatus {
+                direct: per_peer.values().filter(|l| !l.relayed).count(),
+                relayed: per_peer.values().filter(|l| l.relayed).count(),
+                worst_rtt: per_peer.values().map(|l| l.rtt).max(),
+                per_peer,
+            }
         };
+        let healthy = [(2, false, 18), (3, false, 24), (4, false, 31)];
+        // Deniz drops to a relay; everyone else stays direct, so the header, the far
+        // can and his row in the roster all have to agree on who it is.
+        let relayed = [(2, false, 18), (3, false, 24), (4, true, 140)];
 
         let mut app = App::new(
             me,
@@ -1101,7 +1364,6 @@ mod pictures {
         app.voice = Some(ChannelId(0));
         app.voice_available = true;
         app.motion = true;
-        app.link = direct(0, 0);
         app.active_input_name = Some("MacBook Pro Microphone".into());
         app.active_output_name = Some("AirPods Pro".into());
         app.input_gate = 0.23;
@@ -1138,31 +1400,27 @@ mod pictures {
                     app.apply(Event::Roster(vec![
                         peer(1, "alice", Some(ChannelId(0))),
                         peer(2, "bob", Some(ChannelId(0))),
-                        peer(3, "cem", Some(ChannelId(1))),
+                        peer(3, "cem", Some(ChannelId(0))),
+                        peer(4, "deniz", Some(ChannelId(0))),
+                        peer(5, "jack", Some(ChannelId(1))),
                     ]));
-                    app.link = direct(18, 2);
+                    app.take_link(links(&healthy));
                 }
                 BOB_SAYS => say(&mut app, bob, "hey, can you hear me alright?", 0),
                 SEND => {
                     say(&mut app, me, reply, 40);
                     app.input.clear();
                 }
-                RELAY => {
-                    app.link = crate::net::voice::LinkStatus {
-                        direct: 1,
-                        relayed: 1,
-                        worst_rtt: Some(std::time::Duration::from_millis(140)),
-                    };
-                }
+                RELAY => app.take_link(links(&relayed)),
                 RELAY_SAYS => say(
                     &mut app,
-                    bob,
+                    deniz,
                     "on hotel wifi now, coming through a relay",
                     95,
                 ),
                 MEND => {
                     app.dropped_at = None;
-                    app.link = direct(18, 2);
+                    app.take_link(links(&healthy));
                 }
                 SETTINGS => {
                     app.view_mode = ViewMode::Settings;
@@ -1172,13 +1430,21 @@ mod pictures {
                 _ => {}
             }
 
-            // Bob talks over the taut string, then again over the relay and the fray —
+            // Bob talks over the taut string, then deniz over the relay and the fray —
             // the pulse slows down with the round trip.
-            let talking = (TALK..TYPE).contains(&f) || (RELAY_SAYS..MEND).contains(&f);
-            if talking {
-                app.speaking.insert(bob);
+            let talker = if (TALK..TYPE).contains(&f) {
+                Some(bob)
+            } else if (RELAY_SAYS..MEND).contains(&f) {
+                Some(deniz)
+            } else {
+                None
+            };
+            if let Some(talker) = talker {
+                app.speaking.clear();
+                app.peer_levels.clear();
+                app.speaking.insert(talker);
                 let level = [2, 4, 3, 5, 3, 1, 4, 2][(f / 3) % 8];
-                app.peer_levels.insert(bob, level);
+                app.peer_levels.insert(talker, level);
             } else {
                 app.speaking.clear();
                 app.peer_levels.clear();

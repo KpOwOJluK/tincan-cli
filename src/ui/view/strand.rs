@@ -116,6 +116,7 @@ mod tests {
             direct,
             relayed,
             worst_rtt: Some(Duration::from_millis(18)),
+            ..Default::default()
         };
         app
     }

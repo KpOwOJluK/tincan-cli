@@ -291,6 +291,15 @@ fn margin_for(width: u16) -> String {
     " ".repeat((width as usize).saturating_sub(span) / 2)
 }
 
+/// Who the far can stands for: the person the worst link belongs to, so the number
+/// written on the string is theirs; otherwise the first of the others, as ever.
+fn far_end<'a>(app: &'a App, others: &[&'a str]) -> Option<&'a str> {
+    super::named_trouble(app)
+        .and_then(|(id, _, _)| app.peers.iter().find(|p| p.id == id))
+        .map(|p| p.name.as_str())
+        .or_else(|| others.first().copied())
+}
+
 /// The drawing on its own: two cans, and the string with the link written over it.
 /// Exactly `CANS_ROWS` rows, so a caller can budget for it.
 fn cans(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
@@ -301,7 +310,7 @@ fn cans(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
     let margin = margin_for(width);
     let gap = span.saturating_sub(CAN_WIDTH * 2);
 
-    let far = others.first().copied().unwrap_or("");
+    let far = far_end(app, &others).unwrap_or("");
     let label = link_label(app, theme);
     let knot = matches!(strand, Strand::Slack);
 
@@ -373,7 +382,7 @@ fn cans(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
 
 /// The same reading for a terminal too small to draw in.
 fn compact(width: u16, app: &App, theme: &Theme, others: &[&str]) -> Vec<TextLine<'static>> {
-    let far = others.first().copied().unwrap_or("nobody yet");
+    let far = far_end(app, others).unwrap_or("nobody yet");
     let string = theme.glyphs.can.string;
     let text = format!("you {string} {} {string} {far}", link_label(app, theme));
     vec![
@@ -455,9 +464,13 @@ fn closing(margin: &str, app: &App, theme: &Theme, others: &[&str]) -> Vec<TextL
 
 fn link_label(app: &App, theme: &Theme) -> String {
     let words = strand::label(app).to_lowercase();
-    match app.link.worst_rtt {
+    // The number belongs to the person on the far can.
+    let rtt = super::named_trouble(app)
+        .map(|(_, _, link)| link.rtt)
+        .or(app.link.worst_rtt);
+    match rtt {
         Some(rtt) if app.link.peers() > 0 => {
-            format!("{}ms{}{words}", rtt.as_millis(), theme.glyphs.dot)
+            format!("{}{}{words}", super::millis(rtt), theme.glyphs.dot)
         }
         _ => words,
     }
@@ -731,6 +744,7 @@ mod tests {
             direct: 1,
             relayed: 0,
             worst_rtt: Some(std::time::Duration::from_millis(18)),
+            ..Default::default()
         };
         said(&mut app, 2, 1000, "hi");
 
@@ -787,6 +801,7 @@ mod tests {
             direct: 1,
             relayed: 0,
             worst_rtt: Some(std::time::Duration::from_millis(18)),
+            ..Default::default()
         };
         let drawn: String = diagram(Rect::new(0, 0, 70, 20), &app, &Theme::from_env())
             .iter()
@@ -826,5 +841,76 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(drawn.contains("you"), "{drawn}");
+    }
+
+    use crate::net::voice::{LinkStatus, PeerLink};
+
+    fn with_cem(readings: &[(u8, bool, u64)]) -> App {
+        let mut app = room();
+        app.peers.push(PeerInfo {
+            id: PeerId([3; 32]),
+            name: "cem".into(),
+            channel: None,
+            muted: false,
+            deafened: false,
+            afk: false,
+        });
+        app.voice_available = true;
+        // Links are only kept for people in the call we are in.
+        for peer in &mut app.peers {
+            peer.channel = Some(crate::proto::ChannelId(0));
+        }
+        app.voice = Some(crate::proto::ChannelId(0));
+        let per_peer: std::collections::BTreeMap<_, _> = readings
+            .iter()
+            .map(|&(seed, relayed, ms)| {
+                (
+                    PeerId([seed; 32]),
+                    PeerLink {
+                        relayed,
+                        rtt: std::time::Duration::from_millis(ms),
+                    },
+                )
+            })
+            .collect();
+        app.take_link(LinkStatus {
+            direct: per_peer.values().filter(|l| !l.relayed).count(),
+            relayed: per_peer.values().filter(|l| l.relayed).count(),
+            worst_rtt: per_peer.values().map(|l| l.rtt).max(),
+            per_peer,
+        });
+        app
+    }
+
+    #[test]
+    fn the_far_can_is_whoever_the_bad_link_belongs_to() {
+        let app = with_cem(&[(2, false, 20), (3, true, 340)]);
+        let rows = cans(70, &app, &Theme::from_env());
+        assert!(text(&rows[0]).contains("cem"), "{}", text(&rows[0]));
+        assert!(text(&rows[2]).contains("340ms"), "{}", text(&rows[2]));
+    }
+
+    #[test]
+    fn a_healthy_room_keeps_the_first_person_on_the_far_can() {
+        let app = with_cem(&[(2, false, 20), (3, false, 30)]);
+        let rows = cans(70, &app, &Theme::from_env());
+        assert!(text(&rows[0]).contains("bob"), "{}", text(&rows[0]));
+    }
+
+    #[test]
+    fn a_choppy_call_keeps_the_first_person_on_the_far_can() {
+        let mut app = with_cem(&[(2, false, 20), (3, true, 340)]);
+        app.dropped_at = Some(std::time::Instant::now());
+        let rows = cans(70, &app, &Theme::from_env());
+        assert!(text(&rows[0]).contains("bob"), "{}", text(&rows[0]));
+        assert!(!text(&rows[0]).contains("cem"), "{}", text(&rows[0]));
+    }
+
+    #[test]
+    fn a_small_pane_names_the_same_person() {
+        let app = with_cem(&[(2, false, 20), (3, true, 340)]);
+        let others = others_of(&app);
+        let rows = compact(40, &app, &Theme::from_env(), &others);
+        assert!(text(&rows[1]).contains("cem"), "{}", text(&rows[1]));
     }
 }
