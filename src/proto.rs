@@ -10,13 +10,17 @@ use serde::{Deserialize, Serialize};
 
 /// The ALPN used on the control stream.
 ///
-/// Version 1: the password proof became a MAC under an Argon2id-stretched key. A /0 peer
-/// would fail the handshake with a misleading "wrong password", so the two do not meet.
-pub const ALPN: &[u8] = b"tincan/control/1";
+/// Version 2 extends the control plane with FileOffer metadata. File bytes themselves
+/// use FILE_ALPN and therefore never pass through the room coordinator.
+pub const ALPN: &[u8] = b"tincan/control/4";
 
 /// The ALPN used in the voice mesh. Separate from the control plane: voice links are
 /// established directly between peers and never pass through the coordinator.
 pub const VOICE_ALPN: &[u8] = b"tincan/voice/0";
+
+/// ALPN для прямой передачи файлов между участниками комнаты.
+/// Файлы не идут через координатора: control plane передаёт только метаданные.
+pub const FILE_ALPN: &[u8] = b"tincan/file/1";
 
 /// Voice packet header — the first bytes of the datagram.
 ///
@@ -69,6 +73,13 @@ pub const MAX_CHAT_CHARS: usize = 2000;
 /// Maximum number of characters in a nickname.
 pub const MAX_NAME_CHARS: usize = 24;
 
+/// Максимальная длина отображаемого имени файла.
+pub const MAX_FILE_NAME_CHARS: usize = 255;
+
+/// Жёсткий протокольный потолок размера одного файла: 16 GiB.
+/// Пользовательский лимит отправки может быть ниже, но не выше этого значения.
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Peer identity — the raw form of an iroh public key.
 ///
 /// Because identity and cryptographic verification are the same thing here, there are
@@ -97,6 +108,80 @@ impl std::fmt::Display for PeerId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChannelId(pub u8);
 
+/// Случайный идентификатор одной файловой раздачи.
+/// 128 бит достаточно, чтобы идентификатор одновременно служил непредсказуемым capability token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TransferId(pub [u8; 16]);
+
+impl TransferId {
+    /// Короткая форма для команд /get и списка файлов.
+    pub fn short(&self) -> String {
+        self.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+impl std::fmt::Display for TransferId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Небольшой безопасный предпросмотр, который можно передать вместе с метаданными.
+/// Изображение уменьшается до нескольких сотен RGB-точек; исходный файл здесь не хранится.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilePreview {
+    Generic {
+        kind: String,
+    },
+    Image {
+        width: u32,
+        height: u32,
+        thumb_width: u8,
+        thumb_height: u8,
+        rgb: Vec<u8>,
+    },
+}
+
+/// Метаданные файла, распространяемые через control plane.
+/// Содержимое файла по control plane никогда не передаётся.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOffer {
+    pub id: TransferId,
+    pub channel: ChannelId,
+    pub from: PeerId,
+    /// None = общий доступ в исходном канале; Some = только конкретному участнику.
+    pub recipient: Option<PeerId>,
+    pub name: String,
+    pub size: u64,
+    pub preview: FilePreview,
+    /// BLAKE2s-256 всего файла, вычисленный до публикации предложения.
+    pub digest: [u8; 32],
+}
+
+/// Первый запрос внутри прямого FILE_ALPN соединения.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRequest {
+    pub id: TransferId,
+    /// Канал, из которого пользователь инициировал скачивание.
+    pub channel: ChannelId,
+}
+
+/// Ответ отправителя перед началом потока байтов.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileResponse {
+    Accepted {
+        name: String,
+        size: u64,
+        digest: [u8; 32],
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
 /// A peer's publicly visible state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
@@ -121,6 +206,8 @@ pub struct RoomSnapshot {
     pub peers: Vec<PeerInfo>,
     /// Recent messages per channel (ordered, oldest → newest).
     pub recent_chat: Vec<ChatLine>,
+    /// Все публичные файлы, объявленные за время жизни комнаты.
+    pub public_files: Vec<FileOffer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,14 +222,39 @@ pub struct ChatLine {
 /// Client → coordinator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToCoordinator {
-    /// Answer to the challenge: nickname + `MAC(admission key, nonce)`.
-    Hello { name: String, proof: [u8; 32] },
+    /// First control message: nickname plus an optional one-time enrollment token.
+    /// The QUIC connection itself proves the sender's PeerId.
+    Hello {
+        name: String,
+        invite: Option<[u8; 32]>,
+    },
     /// Switch voice channel; `None` means leave voice entirely.
-    SwitchChannel { channel: Option<ChannelId> },
-    Chat { channel: ChannelId, text: String },
-    SetMuted { muted: bool },
-    SetDeafened { deafened: bool },
-    SetAfk { afk: bool },
+    SwitchChannel {
+        channel: Option<ChannelId>,
+    },
+    Chat {
+        channel: ChannelId,
+        text: String,
+    },
+    /// Публикует метаданные файла. Сам файл передаётся позже напрямую по FILE_ALPN.
+    OfferFile {
+        channel: ChannelId,
+        id: TransferId,
+        recipient: Option<PeerId>,
+        name: String,
+        size: u64,
+        preview: FilePreview,
+        digest: [u8; 32],
+    },
+    SetMuted {
+        muted: bool,
+    },
+    SetDeafened {
+        deafened: bool,
+    },
+    SetAfk {
+        afk: bool,
+    },
     /// A graceful goodbye. Without it, the coordinator finds out when the link drops.
     Leave,
 }
@@ -150,18 +262,29 @@ pub enum ToCoordinator {
 /// Coordinator → client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToPeer {
-    /// Sent as soon as the connection is up; the salt for the password proof.
-    Challenge { nonce: [u8; 16] },
-    Welcome { you: PeerId, room: RoomSnapshot },
-    Rejected { reason: String },
+    /// Sent first so the server-opened bidirectional stream becomes visible to the client.
+    Ready,
+    Welcome {
+        you: PeerId,
+        room: RoomSnapshot,
+    },
+    Rejected {
+        reason: String,
+    },
     /// Any change to the roster — the full list is sent.
     ///
     /// A full list rather than a delta: in a six-person room the list is a few hundred
     /// bytes, and in exchange client state can never drift out of sync.
-    Roster { peers: Vec<PeerInfo> },
+    Roster {
+        peers: Vec<PeerInfo>,
+    },
     Chat(ChatLine),
+    /// Объявление о доступном P2P-файле.
+    FileOffer(FileOffer),
     /// System lines such as "X joined the room".
-    Notice { text: String },
+    Notice {
+        text: String,
+    },
 }
 
 /// Encodes a length-prefixed frame.
@@ -202,7 +325,7 @@ mod tests {
     #[test]
     fn frames_round_trip() {
         let messages = vec![
-            ToPeer::Challenge { nonce: [7; 16] },
+            ToPeer::Ready,
             ToPeer::Welcome {
                 you: PeerId([1; 32]),
                 room: RoomSnapshot {
@@ -215,10 +338,25 @@ mod tests {
                         text: "hello world".into(),
                         at: 1_700_000_000,
                     }],
+                    public_files: Vec::new(),
                 },
             },
-            ToPeer::Roster { peers: vec![sample_peer(3)] },
-            ToPeer::Rejected { reason: "wrong password".into() },
+            ToPeer::Roster {
+                peers: vec![sample_peer(3)],
+            },
+            ToPeer::FileOffer(FileOffer {
+                id: TransferId([4; 16]),
+                channel: ChannelId(1),
+                from: PeerId([2; 32]),
+                recipient: None,
+                name: "screen.png".into(),
+                size: 123_456,
+                preview: FilePreview::Generic { kind: "PNG".into() },
+                digest: [5; 32],
+            }),
+            ToPeer::Rejected {
+                reason: "device not authorized".into(),
+            },
         ];
 
         for message in messages {
@@ -233,10 +371,27 @@ mod tests {
     #[test]
     fn client_messages_round_trip() {
         let messages = vec![
-            ToCoordinator::Hello { name: "alice".into(), proof: [9; 32] },
-            ToCoordinator::SwitchChannel { channel: Some(ChannelId(2)) },
+            ToCoordinator::Hello {
+                name: "alice".into(),
+                invite: Some([9; 32]),
+            },
+            ToCoordinator::SwitchChannel {
+                channel: Some(ChannelId(2)),
+            },
             ToCoordinator::SwitchChannel { channel: None },
-            ToCoordinator::Chat { channel: ChannelId(0), text: "nice one".into() },
+            ToCoordinator::Chat {
+                channel: ChannelId(0),
+                text: "nice one".into(),
+            },
+            ToCoordinator::OfferFile {
+                channel: ChannelId(0),
+                id: TransferId([8; 16]),
+                recipient: None,
+                name: "archive.zip".into(),
+                size: 9_999,
+                preview: FilePreview::Generic { kind: "ZIP".into() },
+                digest: [7; 32],
+            },
             ToCoordinator::SetMuted { muted: true },
             ToCoordinator::SetDeafened { deafened: true },
             ToCoordinator::SetAfk { afk: true },
@@ -303,7 +458,10 @@ mod tests {
 
     #[test]
     fn short_id_is_stable_and_readable() {
-        let id = PeerId([0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let id = PeerId([
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
         assert_eq!(id.short(), "abcdef0123");
         assert_eq!(id.to_string().len(), 64);
     }

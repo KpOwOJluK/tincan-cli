@@ -1,146 +1,122 @@
-//! The invite code: the coordinator's identity in a form a human can carry.
+//! One-time enrollment invitations.
 //!
-//! The code *is* the coordinator's public key — it cannot be shortened, because it is
-//! the identity itself. All we can do is make it readable: base32 instead of hex
-//! (64 → 52 characters), split into groups, and forgiving about formatting on the way
-//! back in.
-//!
-//! A room opened by name and passphrase (see `auth`) does not need the code at all; this
-//! remains the way in whose security does not rest on a passphrase.
+//! The invitation is not a reusable room credential. It carries only the coordinator
+//! public identity and a random 256-bit token. The server consumes that token on the
+//! first successful enrollment and persists the joining device's PeerId.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use data_encoding::BASE32_NOPAD;
 
-/// Length of each group in the grouped representation.
-const GROUP: usize = 4;
-/// The base32 length of 32 bytes.
-const CODE_CHARS: usize = 52;
+use crate::proto::PeerId;
 
-/// Turns a 32-byte identity into a shareable code.
-pub fn encode(key: &[u8; 32]) -> String {
-    let raw = BASE32_NOPAD.encode(key).to_lowercase();
-    raw.as_bytes()
-        .chunks(GROUP)
-        .map(|chunk| std::str::from_utf8(chunk).expect("base32 output is ascii"))
-        .collect::<Vec<_>>()
-        .join("-")
+pub type InviteToken = [u8; 32];
+
+const PREFIX: &str = "fd1";
+const PART_CHARS: usize = 52;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Invite {
+    pub coordinator: PeerId,
+    pub token: InviteToken,
 }
 
-/// Whether `text` is meant as an invite code rather than a room name.
-///
-/// Only the shape is checked — 52 ASCII letters and digits once the formatting is gone —
-/// so that a code with a typo still lands in `decode` and gets told what is wrong with it,
-/// instead of being taken for a room name. Room names are capped below 52 characters, so
-/// no room name can pass.
-pub fn looks_like_code(text: &str) -> bool {
-    let kept: Vec<char> = text.chars().filter(|c| !is_formatting(*c)).collect();
-    kept.len() == CODE_CHARS && kept.iter().all(char::is_ascii_alphanumeric)
+pub fn encode(invite: &Invite) -> String {
+    format!(
+        "{PREFIX}.{}.{}",
+        encode_part(&invite.coordinator.0),
+        encode_part(&invite.token)
+    )
 }
 
-fn is_formatting(c: char) -> bool {
-    c.is_whitespace() || c == '-' || c == '_'
+pub fn decode(text: &str) -> Result<Invite> {
+    let normalized = text.trim().to_ascii_lowercase();
+    let mut parts = normalized.split('.');
+
+    let Some(prefix) = parts.next() else {
+        bail!("invite is empty");
+    };
+    let Some(coordinator) = parts.next() else {
+        bail!("invite is incomplete");
+    };
+    let Some(token) = parts.next() else {
+        bail!("invite is incomplete");
+    };
+    if parts.next().is_some() {
+        bail!("invite has too many parts");
+    }
+    if prefix != PREFIX {
+        bail!("unsupported invite format");
+    }
+
+    Ok(Invite {
+        coordinator: PeerId(decode_part(coordinator)?),
+        token: decode_part(token)?,
+    })
 }
 
-/// Turns a code back into an identity.
-///
-/// People copy the code out of a chat app and paste it, so dashes, spaces, line breaks
-/// and letter case are all ignored.
-pub fn decode(code: &str) -> Result<[u8; 32]> {
-    let cleaned: String = code
-        .chars()
-        .filter(|c| !is_formatting(*c))
-        .flat_map(|c| c.to_uppercase())
-        .collect();
+pub fn looks_like_invite(text: &str) -> bool {
+    text.trim()
+        .get(..PREFIX.len() + 1)
+        .is_some_and(|head| head.eq_ignore_ascii_case("fd1."))
+}
 
-    if cleaned.len() != CODE_CHARS {
+fn encode_part(bytes: &[u8; 32]) -> String {
+    BASE32_NOPAD.encode(bytes).to_ascii_lowercase()
+}
+
+fn decode_part(text: &str) -> Result<[u8; 32]> {
+    if text.len() != PART_CHARS {
         bail!(
-            "an invite code must be {} characters, got {}",
-            CODE_CHARS,
-            cleaned.len()
+            "invite component must be {PART_CHARS} characters, got {}",
+            text.len()
         );
     }
 
+    let upper = text.to_ascii_uppercase();
     let bytes = BASE32_NOPAD
-        .decode(cleaned.as_bytes())
-        .map_err(|_| anyhow::anyhow!("the invite code contains an invalid character"))?;
+        .decode(upper.as_bytes())
+        .map_err(|_| anyhow!("invite contains an invalid character"))?;
 
-    let key: [u8; 32] = bytes
+    bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("the invite code did not decode to 32 bytes"))?;
-    Ok(key)
+        .map_err(|_| anyhow!("invite component did not decode to 32 bytes"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn key(seed: u8) -> [u8; 32] {
-        let mut k = [0u8; 32];
-        for (i, byte) in k.iter_mut().enumerate() {
-            *byte = seed.wrapping_add(i as u8).wrapping_mul(7);
-        }
-        k
+    #[test]
+    fn round_trip() {
+        let invite = Invite {
+            coordinator: PeerId([7; 32]),
+            token: [9; 32],
+        };
+        assert_eq!(decode(&encode(&invite)).unwrap(), invite);
     }
 
     #[test]
-    fn round_trips() {
-        for seed in [0u8, 1, 42, 255] {
-            let original = key(seed);
-            let code = encode(&original);
-            assert_eq!(decode(&code).unwrap(), original);
-        }
+    fn decode_is_case_insensitive_and_trims_outer_space() {
+        let invite = Invite {
+            coordinator: PeerId([1; 32]),
+            token: [2; 32],
+        };
+        let upper = encode(&invite).to_ascii_uppercase();
+        assert_eq!(decode(&format!("  {upper}\n")).unwrap(), invite);
     }
 
     #[test]
-    fn code_is_grouped_and_shorter_than_hex() {
-        let code = encode(&key(1));
-        // 52 characters + 12 dashes
-        assert_eq!(code.len(), CODE_CHARS + CODE_CHARS / GROUP - 1);
-        assert!(code.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit()));
-        assert!(code.contains('-'));
-        // Hex would have been 64 characters.
-        assert!(code.chars().filter(|c| *c != '-').count() < 64);
-    }
-
-    /// However the user pastes the code, it should work.
-    #[test]
-    fn decoding_tolerates_user_formatting() {
-        let original = key(9);
-        let canonical = encode(&original);
-        let variants = [
-            canonical.replace('-', ""),
-            canonical.to_uppercase(),
-            format!("  {canonical}\n"),
-            canonical.replace('-', " "),
-            canonical.replace('-', "_"),
-        ];
-        for variant in variants {
-            assert_eq!(decode(&variant).unwrap(), original, "failed on: {variant:?}");
-        }
+    fn random_text_is_not_mistaken_for_an_invite() {
+        assert!(!looks_like_invite("general"));
+        assert!(!looks_like_invite("abcd-efgh"));
+        assert!(looks_like_invite("FD1.abc.def"));
     }
 
     #[test]
-    fn codes_and_room_names_are_told_apart() {
-        let code = encode(&key(5));
-        assert!(looks_like_code(&code));
-        assert!(looks_like_code(&code.to_uppercase().replace('-', " ")));
-        // A typo is still a code, so that decoding can say what is wrong with it.
-        assert!(looks_like_code(&format!("1118{}", &code[4..])));
-
-        assert!(!looks_like_code("lobby"));
-        assert!(!looks_like_code(&"a".repeat(crate::auth::MAX_ROOM_CHARS)));
-        assert!(!looks_like_code(&"ş".repeat(CODE_CHARS)), "only ASCII can be a code");
-    }
-
-    #[test]
-    fn rejects_malformed_codes() {
-        let valid = encode(&key(3));
-        assert!(decode("").is_err(), "empty code");
-        assert!(decode(&valid[..20]).is_err(), "short code");
-        assert!(decode(&format!("{valid}aaaa")).is_err(), "long code");
-        // '1' and '8' are not in the base32 alphabet — a typo must not pass silently.
-        let typo = format!("1118{}", &valid[4..]);
-        assert!(decode(&typo).is_err(), "invalid character");
+    fn malformed_invites_are_rejected() {
+        assert!(decode("").is_err());
+        assert!(decode("fd1.short.short").is_err());
+        assert!(decode("fd2.aaaaaaaa.bbbbbbbb").is_err());
     }
 }

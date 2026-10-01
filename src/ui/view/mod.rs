@@ -124,8 +124,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     frame.render_widget(Block::default().style(theme.panel()), area);
 
     let right = vec![
-        Span::styled("f1 code ", theme.dim()),
-        Span::styled(short_code(&app.invite_code, theme), theme.brass()),
+        Span::styled("f1 invite ", theme.dim()),
         Span::raw(" "),
     ];
     // One column for the indent, one so the two halves never touch.
@@ -202,11 +201,6 @@ fn clip(text: &str, width: usize, theme: &Theme) -> String {
     }
     let kept: String = text.chars().take(width - 1).collect();
     format!("{kept}{}", theme.glyphs.cut)
-}
-
-fn short_code(code: &str, theme: &Theme) -> String {
-    let head: String = code.chars().take(9).collect();
-    format!("{head}{}", theme.glyphs.cut)
 }
 
 #[cfg(test)]
@@ -286,7 +280,10 @@ mod tests {
         let theme = Theme::from_env();
 
         let full = fit(&app, 80, &theme);
-        assert!(full.contains("←→"), "the dials are only discoverable from here: {full}");
+        assert!(
+            full.contains("←→"),
+            "the dials are only discoverable from here: {full}"
+        );
         for width in [70, 55, 40, 20, 4] {
             assert!(fit(&app, width, &theme).chars().count() <= width);
         }
@@ -328,24 +325,34 @@ mod tests {
     }
 
     #[test]
-    fn the_invite_code_survives_a_crowded_footer() {
-        // The shortcuts shorten so the code keeps its corner; the code is the one
-        // thing on that row nobody can retype from memory.
+    fn the_invite_action_survives_a_crowded_footer() {
         for width in [72, 76, 80, 100] {
             let screen = rendered(width, 24, &room());
             let footer = screen.lines().last().unwrap();
-            assert!(footer.contains("f1 code"), "lost the code at {width}: {footer}");
+            assert!(
+                footer.contains("f1 invite"),
+                "lost the invite action at {width}: {footer}"
+            );
         }
     }
 
     #[test]
     fn a_narrow_terminal_drops_the_rail_and_keeps_the_talk() {
         let wide = rendered(80, 24, &room());
-        assert!(wide.contains("CHANNELS"), "the rail belongs on a normal terminal");
+        assert!(
+            wide.contains("CHANNELS"),
+            "the rail belongs on a normal terminal"
+        );
 
         let narrow = rendered(50, 24, &room());
-        assert!(!narrow.contains("CHANNELS"), "the rail must give way:\n{narrow}");
-        assert!(narrow.contains("say something"), "the message field must survive:\n{narrow}");
+        assert!(
+            !narrow.contains("CHANNELS"),
+            "the rail must give way:\n{narrow}"
+        );
+        assert!(
+            narrow.contains("say something"),
+            "the message field must survive:\n{narrow}"
+        );
     }
 
     #[test]
@@ -379,7 +386,10 @@ mod tests {
     fn clipping_marks_what_it_cut() {
         let theme = Theme::from_env();
         assert_eq!(clip("general", 20, &theme), "general");
-        assert_eq!(clip("a very long device name", 8, &theme).chars().count(), 8);
+        assert_eq!(
+            clip("a very long device name", 8, &theme).chars().count(),
+            8
+        );
         assert!(clip("a very long device name", 8, &theme).starts_with("a very"));
         assert_eq!(clip("abc", 0, &theme), "");
     }
@@ -389,7 +399,10 @@ mod tests {
         let app = room();
         let theme = Theme::from_env();
         assert!(fit(&app, 80, &theme).contains("f3 mute"));
-        assert!(fit(&app, 55, &theme).contains("f3 mute"), "the ladder must not skip a rung");
+        assert!(
+            fit(&app, 55, &theme).contains("f3 mute"),
+            "the ladder must not skip a rung"
+        );
         assert!(fit(&app, 40, &theme).chars().count() <= 40);
         assert!(fit(&app, 12, &theme).chars().count() <= 12);
         assert!(fit(&app, 3, &theme).chars().count() <= 3);
@@ -429,7 +442,9 @@ mod pictures {
     }
 
     fn escape(text: &str) -> String {
-        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     /// Draws the interface and writes it out as SVG.
@@ -549,7 +564,10 @@ mod pictures {
     /// The room mid-conversation: three people, one of them turned down.
     fn hero() -> App {
         let me = PeerId([1; 32]);
-        let mut app = App::new(me, "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into());
+        let mut app = App::new(
+            me,
+            "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into(),
+        );
         app.apply(Event::Welcome {
             me,
             room: RoomSnapshot {
@@ -561,6 +579,7 @@ mod pictures {
                     peer(3, "cem", Some(ChannelId(1))),
                 ],
                 recent_chat: vec![],
+                public_files: vec![],
             },
         });
         app.voice = Some(ChannelId(0));
@@ -642,7 +661,8 @@ mod pictures {
         for (name, app, rows) in [("room", hero(), 22u16), ("audio", settings(), 22)] {
             let path = format!("assets/{name}.svg");
             let picture = svg(&app, 84, rows);
-            std::fs::write(&path, &picture).unwrap_or_else(|e| panic!("could not write {path}: {e}"));
+            std::fs::write(&path, &picture)
+                .unwrap_or_else(|e| panic!("could not write {path}: {e}"));
             println!("{path} — {} bytes", picture.len());
         }
     }
@@ -694,7 +714,11 @@ mod pictures {
         let room_title = if app.room_name.is_empty() {
             "tincan".to_string()
         } else {
-            format!("tincan — {} (#{})", app.room_name, app.channel_name(app.viewing))
+            format!(
+                "tincan — {} (#{})",
+                app.room_name,
+                app.channel_name(app.viewing)
+            )
         };
 
         let mut out = format!(
@@ -720,10 +744,14 @@ mod pictures {
                <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"5.5\" fill=\"#27c93f\"/>\n\
                <text x=\"{:.1}\" y=\"{:.1}\" fill=\"#8a8177\" font-family=\"-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif\" font-size=\"12\" font-weight=\"500\" text-anchor=\"middle\">{}</text>\n\
                <rect x=\"{win_x:.1}\" y=\"{:.1}\" width=\"{win_w:.1}\" height=\"{:.1}\" fill=\"{ground}\"/>\n",
-            win_x + 20.0, win_y + 18.0,
-            win_x + 38.0, win_y + 18.0,
-            win_x + 56.0, win_y + 18.0,
-            win_x + win_w / 2.0, win_y + 22.0,
+            win_x + 20.0,
+            win_y + 18.0,
+            win_x + 38.0,
+            win_y + 18.0,
+            win_x + 56.0,
+            win_y + 18.0,
+            win_x + win_w / 2.0,
+            win_y + 22.0,
             escape(&room_title),
             win_y + WIN_BAR_H,
             win_h - WIN_BAR_H
@@ -780,7 +808,10 @@ mod pictures {
         let bob = PeerId([2; 32]);
 
         // Start with clean room and cans diagram clearly visible
-        let mut app = App::new(me, "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into());
+        let mut app = App::new(
+            me,
+            "n73w-kuqc-uog2-4mfx-a7bp-9dlt-2ksv-wq3e-hj5n-x8cr-vy6a-2ptm-4z".into(),
+        );
         app.apply(Event::Welcome {
             me,
             room: RoomSnapshot {
@@ -792,6 +823,7 @@ mod pictures {
                     peer(3, "cem", Some(ChannelId(1))),
                 ],
                 recent_chat: vec![],
+                public_files: vec![],
             },
         });
         app.voice = Some(ChannelId(0));
@@ -809,10 +841,26 @@ mod pictures {
         app.peer_gains.insert(PeerId([3; 32]), 0.0);
 
         const TOTAL_FRAMES: usize = 240;
-        const OVERVIEW: Camera = Camera { x: 640.0, y: 360.0, zoom: 1.0 };
-        const VOICE_FOCUS: Camera = Camera { x: 570.0, y: 350.0, zoom: 1.35 };
-        const CHAT_FOCUS: Camera = Camera { x: 670.0, y: 400.0, zoom: 1.35 };
-        const SETTINGS_FOCUS: Camera = Camera { x: 640.0, y: 320.0, zoom: 1.30 };
+        const OVERVIEW: Camera = Camera {
+            x: 640.0,
+            y: 360.0,
+            zoom: 1.0,
+        };
+        const VOICE_FOCUS: Camera = Camera {
+            x: 570.0,
+            y: 350.0,
+            zoom: 1.35,
+        };
+        const CHAT_FOCUS: Camera = Camera {
+            x: 670.0,
+            y: 400.0,
+            zoom: 1.35,
+        };
+        const SETTINGS_FOCUS: Camera = Camera {
+            x: 640.0,
+            y: 320.0,
+            zoom: 1.30,
+        };
 
         let prompt_text = "loud and clear! tincan is fast";
 
@@ -845,7 +893,12 @@ mod pictures {
             // Voice & Pulse simulation (Bob speaks)
             if (35..85).contains(&f) {
                 app.speaking.insert(bob);
-                let level = match (f / 3) % 4 { 0 => 2, 1 => 4, 2 => 3, _ => 5 };
+                let level = match (f / 3) % 4 {
+                    0 => 2,
+                    1 => 4,
+                    2 => 3,
+                    _ => 5,
+                };
                 app.peer_levels.insert(bob, level);
             } else {
                 app.speaking.clear();
@@ -907,7 +960,9 @@ mod pictures {
         }
 
         println!("Rasterizing SVG frames to PNG in parallel...");
-        let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let chunk_size = TOTAL_FRAMES.div_ceil(num_threads);
 
         std::thread::scope(|s| {
@@ -935,12 +990,18 @@ mod pictures {
         let mp4_status = std::process::Command::new("ffmpeg")
             .args([
                 "-y",
-                "-framerate", "20",
-                "-i", temp_dir.join("frame_%04d.png").to_str().unwrap(),
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-crf", "18",
-                "-preset", "medium",
+                "-framerate",
+                "20",
+                "-i",
+                temp_dir.join("frame_%04d.png").to_str().unwrap(),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                "18",
+                "-preset",
+                "medium",
                 "assets/demo.mp4",
             ])
             .status()

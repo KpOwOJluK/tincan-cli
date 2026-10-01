@@ -3,28 +3,28 @@
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use iroh::Endpoint;
+use tincan::access::{self, ServerAccess};
 use tincan::audio;
-use tincan::auth::{Admission, Key, RoomSecret};
+use tincan::audio::device::Wanted;
 use tincan::clipboard;
 use tincan::config::Config;
 use tincan::invite;
-use tincan::passphrase;
-use tincan::audio::device::Wanted;
 use tincan::net::Command;
 use tincan::net::control::{Client, Coordinator};
-use tincan::net::voice::VoiceMesh;
 use tincan::net::endpoint;
+use tincan::net::voice::VoiceMesh;
 use tincan::proto::PeerId;
 use tincan::room::Room;
 use tincan::ui::{self, VoiceControl};
 
-/// Channels created by default when a room is opened.
+/// Channels created by default on the private coordinator.
 const DEFAULT_CHANNELS: &str = "general,gaming,music";
-/// What a room opened without a name is called on screen.
-const UNNAMED_ROOM: &str = "tincan";
+/// Generic default; a deployment-specific name is stored only in the user's launcher config.
+const PRIVATE_ROOM: &str = "Private";
+const DEFAULT_MAX_FILE_GIB: u64 = 8;
 
 #[derive(Parser)]
 #[command(
@@ -40,42 +40,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Sub {
-    /// Open a room: by name and passphrase, or without a name behind an invite code.
+    /// Start the private coordinator with its persistent identity and allowlist.
     Host {
-        /// Room name. With the passphrase it is the room's address: whoever knows both can
-        /// join by typing them. Leave it out to get an invite code instead.
-        room: Option<String>,
-        /// The nickname you appear under in the room.
+        /// The nickname shown for the server owner.
         #[arg(long, short)]
         name: Option<String>,
-        /// Passphrase. With a room name one is generated if you leave this out; without a
-        /// room name and without this, anyone who has the code can walk in.
-        #[arg(long, short)]
-        password: Option<String>,
+        /// Display name advertised to connected clients.
+        #[arg(long, default_value = PRIVATE_ROOM)]
+        server_name: String,
         /// Comma-separated list of channels.
         #[arg(long, default_value = DEFAULT_CHANNELS)]
         channels: String,
+        /// Maximum size of a file this client may send, 1..=16 GiB.
+        #[arg(long, default_value_t = DEFAULT_MAX_FILE_GIB, value_parser = clap::value_parser!(u64).range(1..=16))]
+        max_file_gib: u64,
+        /// Disable message/join notification sounds while keeping interface feedback sounds.
+        #[arg(long)]
+        no_notifications: bool,
         #[command(flatten)]
         audio: AudioArgs,
     },
-    /// Join a room by its name, or with an invite code.
+    /// Join the saved coordinator, or enroll this device with a one-time invite.
     Join {
-        /// The room name, or the invite code the host shared.
-        room: String,
+        /// One-time invite. Omit it after this device has already been enrolled.
+        invite: Option<String>,
         /// The nickname you appear under in the room.
         #[arg(long, short)]
         name: Option<String>,
-        /// Passphrase. Joining by room name without it asks for it instead, which keeps
-        /// it out of the process list.
-        #[arg(long, short)]
-        password: Option<String>,
-        /// Keep trying to reach the room for up to this many seconds, for when the host
-        /// may not be up yet — a script starting both, or a host restarting.
+        /// Keep trying to reach the server for up to this many seconds.
         #[arg(long, value_name = "SECS")]
         retry: Option<u64>,
+        /// Maximum size of a file this client may send, 1..=16 GiB.
+        #[arg(long, default_value_t = DEFAULT_MAX_FILE_GIB, value_parser = clap::value_parser!(u64).range(1..=16))]
+        max_file_gib: u64,
+        /// Disable message/join notification sounds while keeping interface feedback sounds.
+        #[arg(long)]
+        no_notifications: bool,
         #[command(flatten)]
         audio: AudioArgs,
     },
+    /// Create a one-time invite without opening another server process.
+    Invite {
+        /// Human label stored with the device after enrollment.
+        label: String,
+    },
+    /// List devices in the persistent server allowlist.
+    Peers,
+    /// Remove one device by label or PeerId prefix.
+    Revoke {
+        selector: String,
+    },
+    /// Forget the locally saved coordinator while keeping this device identity.
+    ResetPairing,
     /// List the audio devices tincan can see.
     Devices {
         /// Include what the device picker leaves out: ALSA plugins and each card's raw PCMs.
@@ -101,9 +117,12 @@ struct AudioArgs {
     /// Speaker to use (a distinctive part of its name is enough).
     #[arg(long)]
     output: Option<String>,
-    /// Push-to-talk: the microphone only opens with F4.
+    /// Push-to-talk: the microphone only opens while the configured key is held.
     #[arg(long)]
     ptt: bool,
+    /// Key used for push-to-talk. The native launcher forwards press/release reliably.
+    #[arg(long, default_value = "F4")]
+    ptt_key: String,
 }
 
 #[tokio::main]
@@ -129,8 +148,8 @@ async fn main() -> Result<()> {
 /// did. A redirected stderr is left alone: `2>tincan.log` has always meant "put the
 /// log there", and it still does.
 fn start_logging() -> Option<PathBuf> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "warn".into());
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
 
     if !std::io::stderr().is_terminal() {
         tracing_subscriber::fmt()
@@ -182,7 +201,9 @@ fn report_log(path: Option<PathBuf>) {
     let Some(path) = path else {
         return;
     };
-    let empty = std::fs::metadata(&path).map(|file| file.len() == 0).unwrap_or(true);
+    let empty = std::fs::metadata(&path)
+        .map(|file| file.len() == 0)
+        .unwrap_or(true);
     if empty {
         let _ = std::fs::remove_file(&path);
         return;
@@ -191,25 +212,54 @@ fn report_log(path: Option<PathBuf>) {
         .map(|log| log.lines().count())
         .unwrap_or(0);
     let plural = if lines == 1 { "" } else { "s" };
-    eprintln!("\n  {lines} log line{plural} from this session: {}", path.display());
+    eprintln!(
+        "\n  {lines} log line{plural} from this session: {}",
+        path.display()
+    );
 }
 
 async fn run(command: Sub) -> Result<()> {
     match command {
         Sub::Host {
-            room,
             name,
-            password,
+            server_name,
             channels,
+            max_file_gib,
+            no_notifications,
             audio,
-        } => host(room, name, password, channels, audio).await,
-        Sub::Join {
-            room,
+        } => host(
             name,
-            password,
-            retry,
+            server_name,
+            channels,
+            max_file_gib,
+            no_notifications,
             audio,
-        } => join(room, name, password, retry, audio).await,
+        )
+        .await,
+        Sub::Join {
+            invite,
+            name,
+            retry,
+            max_file_gib,
+            no_notifications,
+            audio,
+        } => join(
+            invite,
+            name,
+            retry,
+            max_file_gib,
+            no_notifications,
+            audio,
+        )
+        .await,
+        Sub::Invite { label } => create_invite(label),
+        Sub::Peers => list_authorized(),
+        Sub::Revoke { selector } => revoke_authorized(selector),
+        Sub::ResetPairing => {
+            access::clear_pairing()?;
+            println!("saved server removed; device identity was kept");
+            Ok(())
+        }
         Sub::Devices { all } => {
             println!("{}", audio::device::describe_devices(all)?);
             Ok(())
@@ -221,156 +271,158 @@ async fn run(command: Sub) -> Result<()> {
     }
 }
 
+fn create_invite(label: String) -> Result<()> {
+    let identity = access::load_or_create_server_identity()?;
+    let coordinator = endpoint::to_peer_id(identity.public());
+    let server_access = ServerAccess::default()?;
+    let invitation = server_access.create_invite(coordinator, &label)?;
+    let code = invite::encode(&invitation);
+    let copied = clipboard::copy(&code);
+
+    println!("one-time invite for {}:", label.trim());
+    println!("{code}");
+    if copied {
+        println!("copied to clipboard");
+    }
+    Ok(())
+}
+
+fn list_authorized() -> Result<()> {
+    let devices = ServerAccess::default()?.list_devices()?;
+    if devices.is_empty() {
+        println!("no authorized devices");
+        return Ok(());
+    }
+
+    println!("authorized devices:");
+    for device in devices {
+        println!("{}  {}  {}", device.peer.short(), device.peer, device.label);
+    }
+    Ok(())
+}
+
+fn revoke_authorized(selector: String) -> Result<()> {
+    let device = ServerAccess::default()?.revoke(&selector)?;
+    println!("revoked {} [{}]", device.label, device.peer.short());
+    Ok(())
+}
+
 async fn host(
-    room_name: Option<String>,
     name: Option<String>,
-    password: Option<String>,
+    server_name: String,
     channels: String,
+    max_file_gib: u64,
+    no_notifications: bool,
     audio: AudioArgs,
 ) -> Result<()> {
     tincan::logo::print_banner();
+    tincan::net::file::set_send_limit_gib(max_file_gib)?;
     let channels: Vec<String> = channels
         .split(',')
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .collect();
 
-    // A room opened by name always has a passphrase, generated unless one was given: with
-    // the name it is the room's address, and a guessable one is a room anyone can find.
-    let generated = room_name.is_some() && password.is_none();
-    let password = match password {
-        Some(typed) => typed,
-        None if generated => passphrase::generate(),
-        None => String::new(),
-    };
-    let secret = match &room_name {
-        Some(room) => {
-            if !generated && passphrase::is_weak(&password) {
-                println!("{}", tincan::logo::heading(
-                    "  that passphrase is easy to guess, and here it is the room's address as well as its lock.\n  leave out -p and tincan makes one up.",
-                ));
-            }
-            Some(RoomSecret::derive(room, &password)?)
-        }
-        None => None,
-    };
-    let room = Room::new(room_name.as_deref().unwrap_or(UNNAMED_ROOM).trim(), channels)?;
+    let identity = access::load_or_create_server_identity()?;
+    let server_access = ServerAccess::default()?;
+    let room = Room::new(server_name.trim(), channels)?;
 
     println!("{}", tincan::logo::heading("  connecting to the network…"));
-    let endpoint = endpoint::bind(secret.as_ref().map(RoomSecret::identity)).await?;
+    let endpoint = endpoint::bind(Some(identity)).await?;
     let me = endpoint::to_peer_id(endpoint.id());
-    let admission = match &secret {
-        Some(secret) => Admission::room(secret, &password)?,
-        None => Admission::invite(&password, &me)?,
-    };
     let (mesh, control) = setup_voice(&endpoint, me, &audio);
 
-    let mut session = Coordinator::spawn(endpoint, room, admission, &nickname(name), mesh).await?;
+    let mut session =
+        Coordinator::spawn(endpoint, room, server_access, &nickname(name), mesh).await?;
 
-    match &room_name {
-        Some(room) => {
-            println!("\n{}", tincan::logo::heading("  the room is open. tell whoever you want in it:"));
-            println!("\n    room:        {}", tincan::logo::code(room.trim()));
-            println!("    passphrase:  {}\n", tincan::logo::code(&password));
-            println!("{}", tincan::logo::heading(&format!("  they run:  tincan join {}", shell_word(room.trim()))));
-        }
-        None => {
-            let copied = clipboard::copy(&session.invite_code);
-            println!("\n{}", tincan::logo::heading("  the room is open. send this code to whoever you want in it:"));
-            println!("\n    {}\n", tincan::logo::code(&session.invite_code));
-            if copied {
-                println!("{}", tincan::logo::heading("  it is on your clipboard already."));
-            }
-            println!("{}", tincan::logo::heading(&format!("  they run:  tincan join {}", session.invite_code)));
-        }
-    }
+    println!(
+        "\n{}",
+        tincan::logo::heading(
+            "  private server is online. create one-time invites with /invite <name>."
+        )
+    );
+    println!(
+        "{}",
+        tincan::logo::heading(
+            "  /auth lists enrolled devices; /revoke <name-or-peer-prefix> removes access."
+        )
+    );
 
-    // Wait for the user rather than a timer. The interface takes over the whole
-    // screen, and a 63-character code is not something anyone can copy against a
-    // countdown. F1 brings it back once the interface is up.
-    print!("\n{}", tincan::logo::heading("  press enter to open the room. f1 brings the code back, f6 is audio."));
+    print!(
+        "\n{}",
+        tincan::logo::heading(
+            "  press enter to open the room. invitations can be created from inside the room."
+        )
+    );
     std::io::stdout().flush().ok();
 
     if let Leaving::Interrupted = wait_at_the_prompt().await {
-        // Leaving from the prompt is still leaving. Without this the process dies
-        // holding an open endpoint, which iroh rightly complains about, and the room
-        // is never told it closed.
         println!();
         let _ = session.commands.send(Command::Quit).await;
-        // Long enough for the host to take its address record down on the way out.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(4), session.events.recv()).await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(4), session.events.recv()).await;
         return Ok(());
     }
 
-    ui::run(session, control, audio.ptt).await
+    ui::run(session, control, audio.ptt, &audio.ptt_key, !no_notifications).await
 }
 
 async fn join(
-    room: String,
+    invite_text: Option<String>,
     name: Option<String>,
-    password: Option<String>,
     retry: Option<u64>,
+    max_file_gib: u64,
+    no_notifications: bool,
     audio: AudioArgs,
 ) -> Result<()> {
     tincan::logo::print_banner();
-    let (coordinator, key) = if invite::looks_like_code(&room) {
-        let coordinator = PeerId(invite::decode(&room).context("could not read the invite code")?);
-        let key = Key::for_invite(&password.unwrap_or_default(), &coordinator)?;
-        (coordinator, key)
-    } else {
-        let passphrase = match password {
-            Some(typed) => typed,
-            None => ask_passphrase(&room)?,
-        };
-        let secret = RoomSecret::derive(&room, &passphrase)?;
-        (secret.coordinator(), secret.key().clone())
+    tincan::net::file::set_send_limit_gib(max_file_gib)?;
+
+    let (coordinator, token) = match invite_text {
+        Some(text) => {
+            let invitation = invite::decode(&text).context("could not read the one-time invite")?;
+            (invitation.coordinator, Some(invitation.token))
+        }
+        None => {
+            let coordinator = access::load_pairing()?.context(
+                "this device is not paired yet; use 'join <one-time-invite>' first",
+            )?;
+            (coordinator, None)
+        }
     };
 
-    println!("{}", tincan::logo::heading("  connecting to the room…"));
-    // The joiner's own identity is always fresh: only the coordinator's is derived.
-    let endpoint = endpoint::bind(None).await?;
+    println!("{}", tincan::logo::heading("  connecting to the private server…"));
+    let identity = access::load_or_create_client_identity()?;
+    let endpoint = endpoint::bind(Some(identity)).await?;
     let me = endpoint::to_peer_id(endpoint.id());
     let (mesh, control) = setup_voice(&endpoint, me, &audio);
 
     let target = endpoint::to_endpoint_id(&coordinator)?;
     let patience = std::time::Duration::from_secs(retry.unwrap_or(0));
     let waiting = |left: std::time::Duration| {
-        println!("{}", tincan::logo::heading(&format!(
-            "  the room is not up yet — trying again ({} s left)",
-            left.as_secs()
-        )));
+        println!(
+            "{}",
+            tincan::logo::heading(&format!(
+                "  server is not reachable yet — trying again ({} s left)",
+                left.as_secs()
+            ))
+        );
     };
-    let session =
-        Client::connect_patiently(endpoint, target, &key, &nickname(name), mesh, patience, waiting)
-            .await?;
 
-    ui::run(session, control, audio.ptt).await
-}
+    let session = Client::connect_patiently(
+        endpoint,
+        target,
+        token,
+        &nickname(name),
+        mesh,
+        patience,
+        waiting,
+    )
+    .await?;
 
-/// Reads the passphrase from the terminal, or from stdin when it is piped.
-///
-/// `-p` still works, but anyone on the machine can read it in `ps` — and for a room opened
-/// by name the passphrase is the room's address, not only its lock. It is not hidden while
-/// typed: it is meant to be said out loud anyway.
-fn ask_passphrase(room: &str) -> Result<String> {
-    print!("{}", tincan::logo::heading(&format!("  passphrase for {}: ", room.trim())));
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("could not read the passphrase")?;
-    let passphrase = line.trim().to_string();
-    ensure!(!passphrase.is_empty(), "joining a room by name needs its passphrase");
-    Ok(passphrase)
-}
-
-/// Quotes a room name for the "they run" line when the shell would split it.
-fn shell_word(word: &str) -> String {
-    if word.chars().all(|c| c.is_alphanumeric() || "-_.".contains(c)) {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
-    }
+    // Only remember the coordinator after the server actually accepted this device.
+    access::save_pairing(coordinator)?;
+    ui::run(session, control, audio.ptt, &audio.ptt_key, !no_notifications).await
 }
 
 /// How the wait at the prompt ended.
@@ -459,32 +511,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_takes_the_room_name_as_its_argument() {
-        let cli = Cli::try_parse_from(["tincan", "host", "lobby", "-p", "a-b-c-d"]).unwrap();
-        let Sub::Host { room, password, .. } = cli.command else {
-            panic!("expected host");
-        };
-        assert_eq!(room.as_deref(), Some("lobby"));
-        assert_eq!(password.as_deref(), Some("a-b-c-d"));
+    fn host_has_no_deployment_credential_argument() {
+        let cli = Cli::try_parse_from(["tincan", "host", "--name", "alice"]).unwrap();
+        assert!(matches!(cli.command, Sub::Host { name: Some(ref value), .. } if value == "alice"));
 
-        let cli = Cli::try_parse_from(["tincan", "host"]).unwrap();
-        assert!(matches!(cli.command, Sub::Host { room: None, .. }), "the unnamed room stays");
+        assert!(
+            Cli::try_parse_from(["tincan", "host", "private-room-name"]).is_err(),
+            "host must not accept a room address or secret on the command line"
+        );
     }
 
     #[test]
-    fn join_takes_a_room_name_or_a_code() {
-        for target in ["lobby", "n73w-kuqc-uog2"] {
-            let cli = Cli::try_parse_from(["tincan", "join", target]).unwrap();
-            assert!(matches!(cli.command, Sub::Join { ref room, .. } if room == target));
-        }
+    fn join_invite_is_optional_after_pairing() {
+        let cli = Cli::try_parse_from(["tincan", "join"]).unwrap();
+        assert!(matches!(cli.command, Sub::Join { invite: None, .. }));
+
+        let code = "fd1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let cli = Cli::try_parse_from(["tincan", "join", code]).unwrap();
+        assert!(matches!(cli.command, Sub::Join { invite: Some(ref value), .. } if value == code));
     }
 
     #[test]
-    fn room_names_are_quoted_only_when_the_shell_needs_it() {
-        assert_eq!(shell_word("lobby"), "lobby");
-        assert_eq!(shell_word("game-night_2"), "game-night_2");
-        assert_eq!(shell_word("game night"), "'game night'");
-        assert_eq!(shell_word("bob's"), "'bob'\\''s'");
+    fn invite_admin_command_requires_only_a_label() {
+        let cli = Cli::try_parse_from(["tincan", "invite", "Alice laptop"]).unwrap();
+        assert!(matches!(cli.command, Sub::Invite { ref label } if label == "Alice laptop"));
     }
 
     #[test]
@@ -495,11 +545,22 @@ mod tests {
             let mut buf = Vec::new();
             clap_complete::generate(shell, &mut Cli::command(), "tincan", &mut buf);
             let script = String::from_utf8(buf).expect("completion script should be valid utf-8");
-            assert!(!script.is_empty(), "completions for {shell:?} must not be empty");
-            assert!(script.contains("host"), "must mention host command for {shell:?}");
-            assert!(script.contains("join"), "must mention join command for {shell:?}");
-            assert!(script.contains("completions"), "must mention completions command for {shell:?}");
+            assert!(
+                !script.is_empty(),
+                "completions for {shell:?} must not be empty"
+            );
+            assert!(
+                script.contains("host"),
+                "must mention host command for {shell:?}"
+            );
+            assert!(
+                script.contains("join"),
+                "must mention join command for {shell:?}"
+            );
+            assert!(
+                script.contains("completions"),
+                "must mention completions command for {shell:?}"
+            );
         }
     }
 }
-

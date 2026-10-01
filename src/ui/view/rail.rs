@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::{clip, spread};
 use crate::proto::ChannelId;
-use crate::ui::state::{App, ViewMode};
+use crate::ui::state::{App, FILES_CHANNEL, ViewMode};
 use crate::ui::theme::Theme;
 
 /// The rail only names the audio hardware when there is room to spare for it.
@@ -31,8 +31,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
-    let audio_rows = if area.height >= AUDIO_NEEDS && app.voice_available { 4 } else { 0 };
-    let channel_rows = (app.channels.len() as u16).saturating_add(CHROME_ROWS);
+    let audio_rows = if area.height >= AUDIO_NEEDS && app.voice_available {
+        4
+    } else {
+        0
+    };
+    let channel_rows = (app.channels.len() as u16)
+        .saturating_add(1)
+        .saturating_add(CHROME_ROWS);
     let [channels, people, audio] = Layout::vertical([
         Constraint::Max(channel_rows),
         Constraint::Min(2),
@@ -40,7 +46,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     ])
     .areas(area);
 
-    section(frame, channels, theme, "CHANNELS", false, channel_rows_of(area.width, app, theme));
+    section(
+        frame,
+        channels,
+        theme,
+        "CHANNELS",
+        false,
+        channel_rows_of(area.width, app, theme),
+    );
 
     // Lit while the cursor is on somebody, the same way the settings screen lights the
     // section its keys are pointed at.
@@ -61,12 +74,26 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             theme.plainly("↑↓")
         ),
     };
-    section(frame, people, theme, &heading, holding, people_rows(area.width, app, theme));
+    section(
+        frame,
+        people,
+        theme,
+        &heading,
+        holding,
+        people_rows(area.width, app, theme),
+    );
 
     if audio.height > 0 {
         let focused = app.view_mode == ViewMode::Settings;
         let heading = format!("AUDIO{}F6", theme.glyphs.dot);
-        section(frame, audio, theme, &heading, focused, audio_rows_of(area.width, app, theme));
+        section(
+            frame,
+            audio,
+            theme,
+            &heading,
+            focused,
+            audio_rows_of(area.width, app, theme),
+        );
     }
 }
 
@@ -82,7 +109,11 @@ fn section(
     if area.height == 0 {
         return;
     }
-    let style = if focused { theme.chip_on() } else { theme.chip() };
+    let style = if focused {
+        theme.chip_on()
+    } else {
+        theme.chip()
+    };
     let mut lines = vec![TextLine::from(vec![
         Span::raw(" "),
         Span::styled(format!(" {label} "), style),
@@ -110,8 +141,9 @@ fn channel_rows_of(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static
     app.channels
         .iter()
         .enumerate()
-        .map(|(index, name)| {
-            let id = ChannelId(index as u8);
+        .map(|(index, name)| (ChannelId(index as u8), name.as_str()))
+        .chain(std::iter::once((FILES_CHANNEL, "Files")))
+        .map(|(id, name)| {
             let reading = id == app.viewing && app.view_mode == ViewMode::Chat;
             let talking = app.voice == Some(id);
             let unread = app.unread.contains(&id);
@@ -119,7 +151,11 @@ fn channel_rows_of(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static
 
             let mark = |on: bool, glyph: char| {
                 Span::styled(
-                    if on { glyph.to_string() } else { " ".to_string() },
+                    if on {
+                        glyph.to_string()
+                    } else {
+                        " ".to_string()
+                    },
                     theme.accent(),
                 )
             };
@@ -181,7 +217,11 @@ fn people_rows(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
                 // The same cursor the channel list uses, in the same column, because
                 // it answers the same question: this is the row your keys act on.
                 Span::styled(
-                    if selected { theme.glyphs.cursor.to_string() } else { " ".to_string() },
+                    if selected {
+                        theme.glyphs.cursor.to_string()
+                    } else {
+                        " ".to_string()
+                    },
                     theme.accent(),
                 ),
                 Span::styled(meter, meter_style),
@@ -224,7 +264,10 @@ fn people_rows(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
                     .map(|channel| app.channel_name(channel).to_string())
                     .unwrap_or_default()
             };
-            let right = vec![Span::styled(clip(&tag, TAG_ROOM, theme), theme.dim()), Span::raw(" ")];
+            let right = vec![
+                Span::styled(clip(&tag, TAG_ROOM, theme), theme.dim()),
+                Span::raw(" "),
+            ];
             spread(width, left, right)
         })
         .collect()
@@ -255,7 +298,10 @@ mod tests {
     use crate::proto::{PeerId, PeerInfo};
 
     fn text(line: &TextLine<'_>) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn room() -> App {
@@ -292,9 +338,18 @@ mod tests {
 
         let general = text(&rows[0]);
         let gaming = text(&rows[1]);
-        assert!(general.contains(theme.glyphs.cursor), "the read channel keeps the cursor: {general}");
-        assert!(!general.contains(theme.glyphs.on_air), "we are not talking there: {general}");
-        assert!(gaming.contains(theme.glyphs.on_air), "the voice channel is marked: {gaming}");
+        assert!(
+            general.contains(theme.glyphs.cursor),
+            "the read channel keeps the cursor: {general}"
+        );
+        assert!(
+            !general.contains(theme.glyphs.on_air),
+            "we are not talking there: {general}"
+        );
+        assert!(
+            gaming.contains(theme.glyphs.on_air),
+            "the voice channel is marked: {gaming}"
+        );
     }
 
     #[test]
@@ -304,11 +359,23 @@ mod tests {
         let theme = Theme::from_env();
         let rows = channel_rows_of(28, &app, &theme);
 
-        let waiting = rows[1].spans.iter().find(|span| span.content.contains("gaming")).unwrap();
-        let quiet = rows[0].spans.iter().find(|span| span.content.contains("general")).unwrap();
-        assert_ne!(waiting.style, quiet.style, "an unread channel has to look different");
+        let waiting = rows[1]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("gaming"))
+            .unwrap();
+        let quiet = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("general"))
+            .unwrap();
         assert_ne!(
-            waiting.style, theme.accent(),
+            waiting.style, quiet.style,
+            "an unread channel has to look different"
+        );
+        assert_ne!(
+            waiting.style,
+            theme.accent(),
             "and different from the colour that means you are already there"
         );
     }
@@ -320,7 +387,10 @@ mod tests {
         let rows = people_rows(28, &app, &theme);
 
         assert!(text(&rows[0]).contains("general"), "{}", text(&rows[0]));
-        assert!(text(&rows[0]).contains("you"), "we are marked in our own roster");
+        assert!(
+            text(&rows[0]).contains("you"),
+            "we are marked in our own roster"
+        );
         assert!(text(&rows[1]).contains("muted"), "{}", text(&rows[1]));
     }
 
@@ -369,7 +439,11 @@ mod tests {
         assert!(text(&rows[0]).contains("afk"), "{}", text(&rows[0]));
 
         // Name span should be styled with theme.dim()
-        let name_span = rows[0].spans.iter().find(|s| s.content.contains("alice")).unwrap();
+        let name_span = rows[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("alice"))
+            .unwrap();
         assert_eq!(name_span.style, theme.dim());
     }
 
@@ -383,13 +457,16 @@ mod tests {
 
         app.peers[1].deafened = true;
         let rows = people_rows(28, &app, &Theme::from_env());
-        assert!(text(&rows[1]).contains("deafened"), "tag should be deafened");
+        assert!(
+            text(&rows[1]).contains("deafened"),
+            "tag should be deafened"
+        );
     }
 
     #[test]
     fn rail_shows_overflow_indicator_when_people_exceed_height() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = room();
         for i in 3..=12 {
@@ -413,7 +490,10 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let screen = format!("{buffer:?}");
-        assert!(screen.contains("more"), "screen should contain overflow count: {screen}");
+        assert!(
+            screen.contains("more"),
+            "screen should contain overflow count: {screen}"
+        );
     }
 
     #[test]
@@ -447,7 +527,10 @@ mod tests {
             selected.contains(theme.glyphs.cursor),
             "the selected row must carry the same cursor the channel list uses: {selected}"
         );
-        assert!(selected.contains("50%"), "and say where the volume now sits: {selected}");
+        assert!(
+            selected.contains("50%"),
+            "and say where the volume now sits: {selected}"
+        );
 
         let other = text(&rows[0]);
         assert!(
@@ -653,6 +736,10 @@ mod tests {
     fn unknown_hardware_still_says_something_true() {
         let app = room();
         let rows = audio_rows_of(28, &app, &Theme::from_env());
-        assert!(text(&rows[0]).contains("system default"), "{}", text(&rows[0]));
+        assert!(
+            text(&rows[0]).contains("system default"),
+            "{}",
+            text(&rows[0])
+        );
     }
 }

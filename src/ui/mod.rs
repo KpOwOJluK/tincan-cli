@@ -1,17 +1,25 @@
 //! The terminal interface.
 
+#[cfg(target_os = "linux")]
+mod global_ptt;
+mod path_completion;
 pub mod state;
 pub mod theme;
 mod view;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
+#[cfg(unix)]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -22,7 +30,10 @@ use crate::config::Config;
 use crate::net::voice::VoiceMesh;
 use crate::net::{Command, Event, Session};
 use crate::proto::{ChannelId, PeerId};
-use state::{App, GATE_STEP, PEER_VOLUME_STEP, SettingsSection, VOLUME_STEP, ViewMode};
+use state::{
+    App, FILES_CHANNEL, GATE_STEP, PEER_VOLUME_STEP, SettingsSection, VOLUME_STEP, ViewMode,
+    format_bytes,
+};
 use theme::Theme;
 
 /// Where the interface holds on to the audio side. Never built if audio failed to
@@ -134,6 +145,14 @@ struct SelfChime {
     known: Option<(bool, bool)>,
 }
 
+fn mic_transition_blip(was_open: bool, is_open: bool) -> Option<Blip> {
+    match (was_open, is_open) {
+        (false, true) => Some(Blip::MicOn),
+        (true, false) => Some(Blip::MicOff),
+        _ => None,
+    }
+}
+
 impl SelfChime {
     fn on_roster(&mut self, muted: bool, deafened: bool) -> Option<Blip> {
         let (was_muted, was_deafened) = self.known.replace((muted, deafened))?;
@@ -141,7 +160,11 @@ impl SelfChime {
         // Shutting your ears closes the microphone with them. That is one action, so
         // it makes one sound; the mute that came along is not news.
         if deafened != was_deafened {
-            return Some(if deafened { Blip::EarsOff } else { Blip::EarsOn });
+            return Some(if deafened {
+                Blip::EarsOff
+            } else {
+                Blip::EarsOn
+            });
         }
         if muted != was_muted {
             return Some(if muted { Blip::MicOff } else { Blip::MicOn });
@@ -178,6 +201,8 @@ pub async fn run(
     mut session: Session,
     voice: Option<VoiceControl>,
     ptt_mode: bool,
+    ptt_key: &str,
+    notifications: bool,
 ) -> Result<()> {
     let theme = Theme::from_env();
     let config = Config::load();
@@ -213,13 +238,41 @@ pub async fn run(
     }));
     let diverted = crate::stderr::divert();
     let mut terminal = ratatui::init();
-    let mut events = spawn_event_reader();
+    #[cfg(unix)]
+    let terminal_keyboard_enhanced =
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    #[cfg(unix)]
+    let _keyboard_guard = if app.ptt_mode && terminal_keyboard_enhanced {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(ptt_keyboard_flags())
+        );
+        Some(KeyboardEnhancementGuard)
+    } else {
+        None
+    };
+
+    let (event_tx, mut events) = spawn_event_reader();
+    #[cfg(target_os = "linux")]
+    let (_global_ptt_guard, global_ptt_note) = if app.ptt_mode {
+        match global_ptt::spawn(ptt_key, event_tx.clone()) {
+            Ok(guard) => (Some(guard), None),
+            Err(note) => (None, Some(note)),
+        }
+    } else {
+        (None, None)
+    };
+    drop(event_tx);
+
     let mut chime = JoinChime::default();
     let mut own_state = SelfChime::default();
     let mut quality_tick = tokio::time::interval(std::time::Duration::from_secs(1));
 
-    let mut startup_notes: Vec<String> =
-        voice.as_ref().map(|v| v.missing()).unwrap_or_default();
+    let mut startup_notes: Vec<String> = voice.as_ref().map(|v| v.missing()).unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    if let Some(note) = global_ptt_note {
+        startup_notes.push(format!("global push-to-talk unavailable: {note}"));
+    }
     // A device that stays gone would otherwise say so once a second, forever.
     let mut last_audio_note: Option<String> = None;
 
@@ -243,13 +296,14 @@ pub async fn run(
                             matches!(&event, Event::Chat(line) if line.from != app.me);
                         let prev_voice = app.voice;
                         app.apply(event);
-                        if someone_wrote && let Some(v) = voice.as_ref() {
+                        if notifications && someone_wrote && let Some(v) = voice.as_ref() {
                             v.play(Blip::Message);
                         }
                         if membership_changed {
                             sync_voice(&app, voice.as_ref()).await;
                             if let Some(v) = voice.as_ref() {
-                                if chime.on_roster(&app, prev_voice) {
+                                let should_chime = chime.on_roster(&app, prev_voice);
+                                if notifications && should_chime {
                                     v.play(Blip::Chime);
                                 }
                                 if let Some(blip) = own_state.on_roster(app.muted, app.deafened) {
@@ -336,11 +390,18 @@ pub async fn run(
                 event = events.recv() => match event {
                     Some(UiEvent::Key(key)) => {
                         let was_afk = app.afk;
-                        if handle_key(&mut app, key, &session.commands, voice.as_ref()).await? {
+                        let mic_was_open = app.mic_open();
+                        if handle_key(&mut app, key, &session.commands, voice.as_ref(), ptt_key).await? {
                             quitting = true;
                             break;
                         }
+                        let mic_is_open = app.mic_open();
                         apply_local_audio_state(&app, voice.as_ref());
+                        if let Some(blip) = mic_transition_blip(mic_was_open, mic_is_open)
+                            && let Some(v) = voice.as_ref()
+                        {
+                            v.play(blip);
+                        }
                         if was_afk && app.afk {
                             app.afk = false;
                             if let Some(me) = app.peers.iter_mut().find(|p| p.id == app.me) {
@@ -349,6 +410,28 @@ pub async fn run(
                             let _ = session.commands.send(Command::SetAfk(false)).await;
                         }
                         app.touch_activity();
+                    }
+                    #[cfg(target_os = "linux")]
+                    Some(UiEvent::GlobalPtt(active)) => {
+                        if app.ptt_mode {
+                            let mic_was_open = app.mic_open();
+                            app.ptt_active = active;
+                            let mic_is_open = app.mic_open();
+                            apply_local_audio_state(&app, voice.as_ref());
+                            if let Some(blip) = mic_transition_blip(mic_was_open, mic_is_open)
+                                && let Some(v) = voice.as_ref()
+                            {
+                                v.play(blip);
+                            }
+                            if app.afk {
+                                app.afk = false;
+                                if let Some(me) = app.peers.iter_mut().find(|p| p.id == app.me) {
+                                    me.afk = false;
+                                }
+                                let _ = session.commands.send(Command::SetAfk(false)).await;
+                            }
+                            app.touch_activity();
+                        }
                     }
                     Some(UiEvent::ScrollUp) => {
                         app.touch_activity();
@@ -425,8 +508,28 @@ pub async fn run(
 /// Events delivered to the main interface loop.
 enum UiEvent {
     Key(KeyEvent),
+    #[cfg(target_os = "linux")]
+    GlobalPtt(bool),
     ScrollUp,
     ScrollDown,
+}
+
+/// RAII guard restoring the terminal keyboard protocol after PTT mode exits.
+#[cfg(unix)]
+fn ptt_keyboard_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+}
+
+#[cfg(unix)]
+struct KeyboardEnhancementGuard;
+
+#[cfg(unix)]
+impl Drop for KeyboardEnhancementGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
 }
 
 /// RAII guard ensuring terminal mouse capture is released when exiting or on panic.
@@ -439,13 +542,14 @@ impl Drop for MouseCaptureGuard {
 }
 
 /// Reading keys and mouse wheel blocks, so it runs on its own thread and is piped into a channel.
-fn spawn_event_reader() -> mpsc::Receiver<UiEvent> {
+fn spawn_event_reader() -> (mpsc::Sender<UiEvent>, mpsc::Receiver<UiEvent>) {
     let (tx, rx) = mpsc::channel(64);
+    let reader_tx = tx.clone();
     std::thread::spawn(move || {
         loop {
             match crossterm::event::read() {
-                Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                    if tx.blocking_send(UiEvent::Key(key)).is_err() {
+                Ok(TermEvent::Key(key)) => {
+                    if reader_tx.blocking_send(UiEvent::Key(key)).is_err() {
                         return;
                     }
                 }
@@ -455,7 +559,7 @@ fn spawn_event_reader() -> mpsc::Receiver<UiEvent> {
                         MouseEventKind::ScrollDown => UiEvent::ScrollDown,
                         _ => continue,
                     };
-                    if tx.blocking_send(ev).is_err() {
+                    if reader_tx.blocking_send(ev).is_err() {
                         return;
                     }
                 }
@@ -464,16 +568,57 @@ fn spawn_event_reader() -> mpsc::Receiver<UiEvent> {
             }
         }
     });
-    rx
+    (tx, rx)
 }
 
 /// Handles a key. Returns `true` if we should quit.
+fn ptt_key_matches(code: &KeyCode, configured: &str) -> bool {
+    let normalized = configured.trim().to_ascii_uppercase();
+    if normalized == "SPACE" {
+        return *code == KeyCode::Char(' ');
+    }
+    if normalized == "CAPSLOCK" {
+        return *code == KeyCode::CapsLock;
+    }
+    if let Some(number) = normalized.strip_prefix('F').and_then(|value| value.parse::<u8>().ok()) {
+        return (1..=12).contains(&number) && *code == KeyCode::F(number);
+    }
+    if normalized.len() == 1 {
+        if let Some(target) = normalized.chars().next() {
+            return matches!(code, KeyCode::Char(ch) if ch.to_ascii_uppercase() == target);
+        }
+    }
+    false
+}
+
 async fn handle_key(
     app: &mut App,
     key: KeyEvent,
     commands: &mpsc::Sender<Command>,
     voice: Option<&VoiceControl>,
+    ptt_key: &str,
 ) -> Result<bool> {
+    if app.ptt_mode {
+        let native_ptt_modifiers =
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+        if key.code == KeyCode::F(11) && key.modifiers.contains(native_ptt_modifiers) {
+            app.ptt_active = true;
+            return Ok(false);
+        }
+        if key.code == KeyCode::F(12) && key.modifiers.contains(native_ptt_modifiers) {
+            app.ptt_active = false;
+            return Ok(false);
+        }
+        if ptt_key_matches(&key.code, ptt_key) {
+            app.ptt_active = key.kind != KeyEventKind::Release;
+            return Ok(false);
+        }
+    }
+
+    if key.kind != KeyEventKind::Press {
+        return Ok(false);
+    }
+
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     // Global Quit
@@ -611,7 +756,9 @@ async fn handle_key(
                                         let _ = cfg.save();
                                     }
                                     Err(err) => {
-                                        app.settings_error = Some(format!("could not switch the microphone: {err:#}"));
+                                        app.settings_error = Some(format!(
+                                            "could not switch the microphone: {err:#}"
+                                        ));
                                     }
                                 }
                             }
@@ -639,7 +786,8 @@ async fn handle_key(
                                         let _ = cfg.save();
                                     }
                                     Err(err) => {
-                                        app.settings_error = Some(format!("could not switch the speaker: {err:#}"));
+                                        app.settings_error =
+                                            Some(format!("could not switch the speaker: {err:#}"));
                                     }
                                 }
                             }
@@ -665,20 +813,18 @@ async fn handle_key(
     // ── Chat Mode Keyboard Handling ─────────────────────────────────────────
     let toggle_voice = key.code == KeyCode::F(2) || (ctrl && key.code == KeyCode::Char('g'));
     let toggle_mute = key.code == KeyCode::F(3) || (ctrl && key.code == KeyCode::Char('t'));
-    let push_to_talk = key.code == KeyCode::F(4);
     let show_code = key.code == KeyCode::F(1);
     let toggle_deafen = key.code == KeyCode::F(5);
 
     if show_code {
-        let copied = crate::clipboard::copy(&app.invite_code);
-        app.show_invite_code(copied);
+        let _ = commands
+            .send(Command::CreateInvite {
+                label: "guest".into(),
+            })
+            .await;
         return Ok(false);
     }
 
-    if push_to_talk && app.ptt_mode {
-        app.ptt_active = !app.ptt_active;
-        return Ok(false);
-    }
     if toggle_deafen {
         let deafened = !app.deafened;
         let _ = commands.send(Command::SetDeafened(deafened)).await;
@@ -746,7 +892,30 @@ async fn handle_key(
         KeyCode::Down if shift || alt || ctrl => app.scroll_down(2),
         KeyCode::End => app.scroll_to_bottom(),
 
-        KeyCode::Tab => app.view_next(true),
+        KeyCode::Tab => {
+            if let Some(completion) =
+                path_completion::complete_sendto_input(&app.input, &app.peers, app.me)
+            {
+                app.input = completion.input;
+                app.status = completion.hint;
+            } else if let Some(completion) = path_completion::complete_send_input(&app.input) {
+                app.input = completion.input;
+                app.status = completion.hint;
+            } else {
+                let offers = app
+                    .visible_file_offers()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                if let Some(completion) = path_completion::complete_get_input(&app.input, &offers) {
+                    app.input = completion.input;
+                    app.status = completion.hint;
+                } else {
+                    app.view_next(true);
+                }
+            }
+        }
         KeyCode::BackTab => app.view_next(false),
 
         // The roster cursor. Arrows are free here — letters go to the message being
@@ -755,7 +924,11 @@ async fn handle_key(
         KeyCode::Down => app.select_peer(true),
         KeyCode::Up => app.select_peer(false),
         KeyCode::Left | KeyCode::Right if app.selected_peer.is_some() => {
-            let direction = if key.code == KeyCode::Right { 1.0 } else { -1.0 };
+            let direction = if key.code == KeyCode::Right {
+                1.0
+            } else {
+                -1.0
+            };
             app.nudge_peer_volume(direction * PEER_VOLUME_STEP);
             if let Some(v) = voice {
                 v.set_peer_gains(&app.peer_gains);
@@ -782,14 +955,207 @@ async fn handle_key(
                     let _ = commands.send(Command::SetAfk(new_afk)).await;
                     return Ok(false);
                 }
+                if trimmed == "/invite" {
+                    app.notice("usage: /invite <device-label>".into());
+                    return Ok(false);
+                }
+                if let Some(label) = trimmed.strip_prefix("/invite ") {
+                    let label = label.trim();
+                    if label.is_empty() {
+                        app.notice("usage: /invite <device-label>".into());
+                    } else {
+                        let _ = commands
+                            .send(Command::CreateInvite {
+                                label: label.to_string(),
+                            })
+                            .await;
+                    }
+                    return Ok(false);
+                }
+                if trimmed == "/auth" {
+                    let _ = commands.send(Command::ListAuthorized).await;
+                    return Ok(false);
+                }
+                if trimmed == "/revoke" {
+                    app.notice("usage: /revoke <device-label-or-peer-prefix>".into());
+                    return Ok(false);
+                }
+                if let Some(selector) = trimmed.strip_prefix("/revoke ") {
+                    let selector = selector.trim();
+                    if selector.is_empty() {
+                        app.notice("usage: /revoke <device-label-or-peer-prefix>".into());
+                    } else {
+                        let _ = commands
+                            .send(Command::RevokeAuthorized {
+                                selector: selector.to_string(),
+                            })
+                            .await;
+                    }
+                    return Ok(false);
+                }
+                if trimmed == "/send" {
+                    app.notice("usage: /send <path-to-file>".into());
+                    return Ok(false);
+                }
+                if let Some(argument) = trimmed.strip_prefix("/send ") {
+                    if app.viewing == FILES_CHANNEL {
+                        app.notice("open a real channel before sharing a public file".into());
+                        return Ok(false);
+                    }
+                    let Some(path) = parse_file_path(argument) else {
+                        app.notice("usage: /send <path-to-file>".into());
+                        return Ok(false);
+                    };
+
+                    let display = path.display().to_string();
+                    app.status = Some(format!("preparing file: {display}"));
+                    let _ = commands
+                        .send(Command::ShareFile {
+                            channel: app.viewing,
+                            recipient: None,
+                            path,
+                        })
+                        .await;
+                    return Ok(false);
+                }
+
+                if trimmed == "/sendto" {
+                    app.notice("usage: /sendto <participant> <path-to-file>".into());
+                    return Ok(false);
+                }
+                if let Some(argument) = trimmed.strip_prefix("/sendto ") {
+                    if app.viewing == FILES_CHANNEL {
+                        app.notice("open a real channel before sending a file".into());
+                        return Ok(false);
+                    }
+                    let Some((who, path_text)) = parse_sendto_argument(argument) else {
+                        app.notice(
+                            "usage: /sendto <participant> <path-to-file> · Tab completes nicknames"
+                                .into(),
+                        );
+                        return Ok(false);
+                    };
+                    let recipient = match app.find_peer(&who) {
+                        Ok(peer) => peer,
+                        Err(message) => {
+                            app.notice(message);
+                            return Ok(false);
+                        }
+                    };
+                    let Some(path) = parse_file_path(path_text) else {
+                        app.notice("usage: /sendto <participant> <path-to-file>".into());
+                        return Ok(false);
+                    };
+                    let display = path.display().to_string();
+                    app.status = Some(format!(
+                        "preparing private file for {}: {display}",
+                        app.name_of(recipient)
+                    ));
+                    let _ = commands
+                        .send(Command::ShareFile {
+                            channel: app.viewing,
+                            recipient: Some(recipient),
+                            path,
+                        })
+                        .await;
+                    return Ok(false);
+                }
+
+                if trimmed == "/get" {
+                    app.notice("usage: /get <file-id>".into());
+                    return Ok(false);
+                }
+                if let Some(argument) = trimmed.strip_prefix("/get ") {
+                    let token = argument.trim();
+                    if token.is_empty() {
+                        app.notice("usage: /get <file-id>".into());
+                        return Ok(false);
+                    }
+
+                    match app.find_file_offer(token) {
+                        Ok(offer) if offer.from == app.me => {
+                            app.notice("that file is already on this computer".into());
+                        }
+                        Ok(offer) => {
+                            if !app.can_download_here(&offer) {
+                                app.notice(format!(
+                                    "open #{} to download {} [{}]",
+                                    app.channel_name(offer.channel),
+                                    offer.name,
+                                    offer.id.short()
+                                ));
+                                return Ok(false);
+                            }
+                            app.status = Some(format!(
+                                "connecting for {} [{}]…",
+                                offer.name,
+                                offer.id.short()
+                            ));
+                            let channel = app.viewing;
+                            let _ = commands
+                                .send(Command::DownloadFile { offer, channel })
+                                .await;
+                        }
+                        Err(message) => app.notice(message),
+                    }
+                    return Ok(false);
+                }
+
+                if trimmed == "/files" {
+                    let lines: Vec<String> = app
+                        .visible_file_offers()
+                        .into_iter()
+                        .rev()
+                        .take(20)
+                        .map(|offer| {
+                            format!(
+                                "{} · {} · {} · {} · /get {}",
+                                offer.id.short(),
+                                app.name_of(offer.from),
+                                offer
+                                    .recipient
+                                    .map(|id| format!("to {}", app.name_of(id)))
+                                    .unwrap_or_else(|| format!(
+                                        "#{}",
+                                        app.channel_name(offer.channel)
+                                    )),
+                                format_bytes(offer.size),
+                                offer.id.short()
+                            )
+                        })
+                        .collect();
+
+                    if lines.is_empty() {
+                        app.notice("no files have been shared in this channel".into());
+                    } else {
+                        app.notice("recent files:".into());
+                        for line in lines {
+                            app.notice(line);
+                        }
+                    }
+                    return Ok(false);
+                }
+
                 if trimmed == "/help" {
-                    app.notice("commands: /afk (toggle away) · /clear (clear chat) · /help".into());
-                    app.notice("shortcuts: F1 invite · F2 mute · F3 deafen · F4 voice · F5 chat · F6 audio · ↑↓ peer · ←→ vol · Ctrl+K silence".into());
+                    app.notice(
+                        "commands: /afk · /invite <label> · /auth · /revoke <device> · /clear · /send <path> · /sendto <user> <path> · /get <id> · /files · /help"
+                            .into(),
+                    );
+                    app.notice("files are transferred directly peer-to-peer; downloads go to Downloads/FakeDiscord".into());
+                    app.notice("file paths: type /send <partial path> and press Tab to complete files/directories".into());
+                    app.notice("shortcuts: F1 new one-time invite (host) · F2 mute · F3 deafen · F5 chat · F6 audio · ↑↓ peer · ←→ vol · Ctrl+K silence".into());
+                    if app.ptt_mode {
+                        app.notice(format!("push-to-talk: hold {ptt_key} to transmit"));
+                    }
                     return Ok(false);
                 }
                 if trimmed == "/clear" {
                     app.clear_channel_chat(app.viewing);
                     app.notice("chat cleared".into());
+                    return Ok(false);
+                }
+                if app.viewing == FILES_CHANNEL {
+                    app.notice("Files is a read-only catalog; open a text channel to chat".into());
                     return Ok(false);
                 }
                 let channel = app.viewing;
@@ -820,6 +1186,85 @@ async fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+/// Разбирает путь после /send, сохраняя пробелы внутри кавычек.
+fn parse_sendto_argument(argument: &str) -> Option<(String, &str)> {
+    let value = argument.trim_start();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(quoted) = value.strip_prefix('"') {
+        let mut escaped = false;
+        let mut end = None;
+        for (index, ch) in quoted.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                end = Some(index);
+                break;
+            }
+        }
+
+        let end = end?;
+        let raw_name = &quoted[..end];
+        let path = quoted[end + 1..].trim_start();
+        if path.is_empty() {
+            return None;
+        }
+
+        let mut name = String::new();
+        let mut escaped = false;
+        for ch in raw_name.chars() {
+            if escaped {
+                name.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                name.push(ch);
+            }
+        }
+        if escaped {
+            name.push('\\');
+        }
+
+        return Some((name, path));
+    }
+
+    let split = value.find(char::is_whitespace)?;
+    let name = value[..split].trim();
+    let path = value[split..].trim_start();
+    if name.is_empty() || path.is_empty() {
+        None
+    } else {
+        Some((name.to_string(), path))
+    }
+}
+
+/// Разбирает путь после /send, сохраняя пробелы внутри кавычек.
+fn parse_file_path(argument: &str) -> Option<PathBuf> {
+    let value = argument.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let value = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
 }
 
 /// Moves whichever dial the settings cursor is on.
@@ -927,9 +1372,7 @@ fn apply_local_audio_state(app: &App, voice: Option<&VoiceControl>) {
 }
 
 /// Waits for the next change in the speaker list.
-async fn next_speakers(
-    speaking: Option<&mut watch::Receiver<HashSet<PeerId>>>,
-) -> HashSet<PeerId> {
+async fn next_speakers(speaking: Option<&mut watch::Receiver<HashSet<PeerId>>>) -> HashSet<PeerId> {
     match speaking {
         Some(speaking) => {
             if speaking.changed().await.is_ok() {
@@ -959,9 +1402,7 @@ async fn next_peer_levels(
 }
 
 /// Waits for the next microphone volume level update.
-async fn next_mic_level(
-    mic_level: Option<&mut watch::Receiver<f32>>,
-) -> f32 {
+async fn next_mic_level(mic_level: Option<&mut watch::Receiver<f32>>) -> f32 {
     match mic_level {
         Some(rx) => {
             if rx.changed().await.is_ok() {
@@ -1027,8 +1468,12 @@ mod tests {
         tx.send(HashMap::from([(PeerId([2; 32]), 3u8)])).unwrap();
         next_peer_levels(Some(&mut rx)).await;
 
-        let again = tokio::time::timeout(Duration::from_millis(150), next_peer_levels(Some(&mut rx)));
-        assert!(again.await.is_err(), "an unchanged meter must not redraw the screen");
+        let again =
+            tokio::time::timeout(Duration::from_millis(150), next_peer_levels(Some(&mut rx)));
+        assert!(
+            again.await.is_err(),
+            "an unchanged meter must not redraw the screen"
+        );
     }
 
     #[tokio::test]
@@ -1053,9 +1498,15 @@ mod tests {
         assert!(back.contains("speaker"), "{back}");
         assert!(back.contains("MacBook Pro Speakers"), "{back}");
 
-        let gone = describe(&Recovered { side: Side::Microphone, device: None });
+        let gone = describe(&Recovered {
+            side: Side::Microphone,
+            device: None,
+        });
         assert!(gone.contains("microphone"), "{gone}");
-        assert!(gone.contains("not reopen"), "silence about a dead microphone helps nobody: {gone}");
+        assert!(
+            gone.contains("not reopen"),
+            "silence about a dead microphone helps nobody: {gone}"
+        );
     }
 
     // ── Your own microphone and ears ────────────────────────────────────────
@@ -1064,7 +1515,11 @@ mod tests {
     fn the_first_roster_is_a_sync_and_says_nothing() {
         let mut chime = SelfChime::default();
         assert_eq!(chime.on_roster(false, false), None);
-        assert_eq!(chime.on_roster(true, false), Some(Blip::MicOff), "but the next change speaks");
+        assert_eq!(
+            chime.on_roster(true, false),
+            Some(Blip::MicOff),
+            "but the next change speaks"
+        );
     }
 
     #[test]
@@ -1083,13 +1538,25 @@ mod tests {
     }
 
     #[test]
+    fn ptt_open_and_release_use_microphone_sounds() {
+        assert_eq!(mic_transition_blip(false, true), Some(Blip::MicOn));
+        assert_eq!(mic_transition_blip(true, false), Some(Blip::MicOff));
+        assert_eq!(mic_transition_blip(false, false), None);
+        assert_eq!(mic_transition_blip(true, true), None);
+    }
+
+    #[test]
     fn shutting_your_ears_makes_one_sound_not_two() {
         let mut chime = SelfChime::default();
         chime.on_roster(false, false);
 
         // F5 deafens and mutes in the same breath, and the roster reports both at
         // once.
-        assert_eq!(chime.on_roster(true, true), Some(Blip::EarsOff), "one action, one sound");
+        assert_eq!(
+            chime.on_roster(true, true),
+            Some(Blip::EarsOff),
+            "one action, one sound"
+        );
         assert_eq!(chime.on_roster(false, false), Some(Blip::EarsOn));
     }
 
@@ -1097,7 +1564,11 @@ mod tests {
     fn a_roster_that_changes_nothing_about_you_is_silent() {
         let mut chime = SelfChime::default();
         chime.on_roster(true, false);
-        assert_eq!(chime.on_roster(true, false), None, "someone else moving is not your business");
+        assert_eq!(
+            chime.on_roster(true, false),
+            None,
+            "someone else moving is not your business"
+        );
     }
 
     // ── The welcome chime ───────────────────────────────────────────────────
@@ -1137,10 +1608,16 @@ mod tests {
         chime.on_roster(&app, None);
 
         let app = room(vec![peer(1, None), peer(2, None)]);
-        assert!(chime.on_roster(&app, None), "second peer arriving must chime");
+        assert!(
+            chime.on_roster(&app, None),
+            "second peer arriving must chime"
+        );
 
         let app = room(vec![peer(1, None), peer(2, None), peer(3, None)]);
-        assert!(chime.on_roster(&app, None), "third peer arriving must chime too");
+        assert!(
+            chime.on_roster(&app, None),
+            "third peer arriving must chime too"
+        );
     }
 
     #[test]
@@ -1150,7 +1627,10 @@ mod tests {
         chime.on_roster(&app, None);
 
         let app = room(vec![peer(1, None), peer(2, Some(3))]);
-        assert!(!chime.on_roster(&app, None), "a peer switching channel is not an arrival");
+        assert!(
+            !chime.on_roster(&app, None),
+            "a peer switching channel is not an arrival"
+        );
     }
 
     #[test]
@@ -1221,7 +1701,7 @@ mod tests {
         let mut app = test_chat_app(20);
 
         let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
-        handle_key(&mut app, key, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key, &cmd_tx, None, "F4").await.unwrap();
 
         assert_eq!(app.scroll_offset, 2);
     }
@@ -1233,7 +1713,7 @@ mod tests {
         app.scroll_offset = 5;
 
         let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
-        handle_key(&mut app, key, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key, &cmd_tx, None, "F4").await.unwrap();
 
         assert_eq!(app.scroll_offset, 3);
     }
@@ -1244,11 +1724,11 @@ mod tests {
         let mut app = test_chat_app(20);
 
         let key_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT);
-        handle_key(&mut app, key_k, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key_k, &cmd_tx, None, "F4").await.unwrap();
         assert_eq!(app.scroll_offset, 2);
 
         let key_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT);
-        handle_key(&mut app, key_j, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key_j, &cmd_tx, None, "F4").await.unwrap();
         assert_eq!(app.scroll_offset, 0);
     }
 
@@ -1262,7 +1742,7 @@ mod tests {
         assert_eq!(app.selected_peer, Some(other));
 
         let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
-        handle_key(&mut app, key, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key, &cmd_tx, None, "F4").await.unwrap();
 
         // Must silence peer instead of scrolling
         assert_eq!(app.scroll_offset, 0);
@@ -1275,11 +1755,11 @@ mod tests {
         let mut app = test_chat_app(20);
 
         let key_up = KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL);
-        handle_key(&mut app, key_up, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key_up, &cmd_tx, None, "F4").await.unwrap();
         assert_eq!(app.scroll_offset, 2);
 
         let key_down = KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL);
-        handle_key(&mut app, key_down, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key_down, &cmd_tx, None, "F4").await.unwrap();
         assert_eq!(app.scroll_offset, 0);
     }
 
@@ -1289,10 +1769,10 @@ mod tests {
         let mut app = test_chat_app(20);
 
         let key_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
-        handle_key(&mut app, key_j, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key_j, &cmd_tx, None, "F4").await.unwrap();
 
         let key_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
-        handle_key(&mut app, key_k, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, key_k, &cmd_tx, None, "F4").await.unwrap();
 
         assert_eq!(app.input, "jk");
         assert_eq!(app.scroll_offset, 0);
@@ -1380,10 +1860,10 @@ mod tests {
         assert!(app.denoise, "it starts on");
 
         let n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
-        handle_key(&mut app, n, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, n, &cmd_tx, None, "F4").await.unwrap();
         assert!(!app.denoise);
 
-        handle_key(&mut app, n, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, n, &cmd_tx, None, "F4").await.unwrap();
         assert!(app.denoise, "and comes back");
     }
 
@@ -1393,9 +1873,12 @@ mod tests {
         let mut app = test_chat_app(20);
 
         let n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
-        handle_key(&mut app, n, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, n, &cmd_tx, None, "F4").await.unwrap();
 
-        assert_eq!(app.input, "n", "the binding belongs to the settings screen only");
+        assert_eq!(
+            app.input, "n",
+            "the binding belongs to the settings screen only"
+        );
         assert!(app.denoise);
     }
 
@@ -1408,11 +1891,11 @@ mod tests {
         assert!(!app.typing_clicks);
 
         let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
-        handle_key(&mut app, space, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, space, &cmd_tx, None, "F4").await.unwrap();
         assert!(app.typing_clicks);
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_key(&mut app, enter, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, enter, &cmd_tx, None, "F4").await.unwrap();
         assert!(!app.typing_clicks);
     }
 
@@ -1424,14 +1907,14 @@ mod tests {
         assert!(!app.afk);
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_key(&mut app, enter, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, enter, &cmd_tx, None, "F4").await.unwrap();
         assert!(app.afk);
         assert_eq!(cmd_rx.recv().await, Some(Command::SetAfk(true)));
 
         // Toggling /afk again sets afk back to false
         app.input = "/afk".into();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_key(&mut app, enter, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, enter, &cmd_tx, None, "F4").await.unwrap();
         assert!(!app.afk);
         assert_eq!(cmd_rx.recv().await, Some(Command::SetAfk(false)));
     }
@@ -1444,7 +1927,7 @@ mod tests {
         let prev_lines = app.lines.len();
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_key(&mut app, enter, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, enter, &cmd_tx, None, "F4").await.unwrap();
 
         assert_eq!(cmd_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         assert!(app.lines.len() >= prev_lines + 2);
@@ -1458,9 +1941,54 @@ mod tests {
 
         app.input = "/clear".into();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_key(&mut app, enter, &cmd_tx, None).await.unwrap();
+        handle_key(&mut app, enter, &cmd_tx, None, "F4").await.unwrap();
 
         assert_eq!(cmd_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         assert_eq!(app.visible_lines().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn configurable_ptt_opens_on_press_and_closes_on_release() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut app = test_chat_app(20);
+        app.ptt_mode = true;
+
+        let press = KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE);
+        handle_key(&mut app, press, &cmd_tx, None, "F8").await.unwrap();
+        assert!(app.ptt_active);
+
+        let release = KeyEvent::new_with_kind(
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        handle_key(&mut app, release, &cmd_tx, None, "F8").await.unwrap();
+        assert!(!app.ptt_active);
+
+        let native_modifiers =
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+        let forwarded_press = KeyEvent::new(KeyCode::F(11), native_modifiers);
+        handle_key(&mut app, forwarded_press, &cmd_tx, None, "F8").await.unwrap();
+        assert!(app.ptt_active);
+
+        let forwarded_release = KeyEvent::new(KeyCode::F(12), native_modifiers);
+        handle_key(&mut app, forwarded_release, &cmd_tx, None, "F8").await.unwrap();
+        assert!(!app.ptt_active);
+    }
+
+    #[test]
+    fn configurable_ptt_matches_arch_friendly_keys() {
+        assert!(ptt_key_matches(&KeyCode::CapsLock, "CAPSLOCK"));
+        assert!(ptt_key_matches(&KeyCode::Char('q'), "Q"));
+        assert!(ptt_key_matches(&KeyCode::Char(' '), "SPACE"));
+        assert!(ptt_key_matches(&KeyCode::F(4), "F4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_ptt_requests_release_events_for_all_keys() {
+        let flags = ptt_keyboard_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 }

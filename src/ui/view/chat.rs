@@ -12,12 +12,13 @@
 use chrono::{Local, TimeZone};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use super::{clip, strand};
-use crate::proto::PeerId;
-use crate::ui::state::{App, Line};
+use crate::proto::{FilePreview, PeerId};
+use crate::ui::state::{App, Line, format_bytes};
 use crate::ui::theme::{Strand, Theme};
 
 /// Messages from one person inside this window are one block.
@@ -137,6 +138,20 @@ fn draw_field(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     frame.render_widget(Block::default().style(theme.panel()), area);
 
     let prompt = format!(" #{} ", app.channel_name(app.viewing));
+    if app.viewing == crate::ui::state::FILES_CHANNEL {
+        frame.render_widget(
+            Paragraph::new(TextLine::from(vec![
+                Span::styled(prompt, theme.dim()),
+                Span::styled(
+                    "public file catalog · open the original channel to download",
+                    theme.dim(),
+                ),
+            ])),
+            area,
+        );
+        return;
+    }
+
     // Everything but the prompt and the caret belongs to what you are typing.
     let room = (area.width as usize).saturating_sub(prompt.chars().count() + 1);
 
@@ -145,7 +160,11 @@ fn draw_field(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         spans.push(Span::styled("say something", theme.dim()));
     } else {
         // Keep the end of a long message in view — that is where the caret is.
-        let typed: String = app.input.chars().skip(app.input.chars().count().saturating_sub(room)).collect();
+        let typed: String = app
+            .input
+            .chars()
+            .skip(app.input.chars().count().saturating_sub(room))
+            .collect();
         spans.push(Span::styled(typed, theme.text()));
     }
     spans.push(Span::styled(theme.glyphs.caret.to_string(), theme.accent()));
@@ -156,7 +175,11 @@ fn draw_field(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 /// How much of the line goes to the time, and the ceiling for the name column. A
 /// gutter that is right on a wide terminal squeezes the words out of a narrow one.
 fn columns(width: u16) -> (usize, usize) {
-    if width >= TIGHT_UNDER { COLUMNS_WIDE } else { COLUMNS_TIGHT }
+    if width >= TIGHT_UNDER {
+        COLUMNS_WIDE
+    } else {
+        COLUMNS_TIGHT
+    }
 }
 
 /// The name column is only as wide as the names in this conversation. A room of
@@ -167,6 +190,7 @@ fn name_column(visible: &[&Line], app: &App, ceiling: usize) -> usize {
         .iter()
         .filter_map(|line| match line {
             Line::Chat(chat) => Some(app.name_of(chat.from).chars().count()),
+            Line::File(offer) => Some(app.name_of(offer.from).chars().count()),
             Line::Notice { .. } => None,
         })
         .max()
@@ -216,11 +240,99 @@ fn transcript(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
                 }
                 previous = Some((chat.from, chat.at));
             }
+            Line::File(offer) => {
+                previous = None;
+                let author = app.name_of(offer.from);
+                let target = offer
+                    .recipient
+                    .map(|id| format!(" → {}", app.name_of(id)))
+                    .unwrap_or_default();
+                let kind = match &offer.preview {
+                    FilePreview::Generic { kind } => kind.clone(),
+                    FilePreview::Image { width, height, .. } => {
+                        format!("image {width}×{height}")
+                    }
+                };
+
+                lines.push(TextLine::from(vec![
+                    Span::styled(" ".repeat(time_column), theme.dim()),
+                    Span::styled(
+                        pad_left(&clip(&author, names, theme), names),
+                        if offer.from == app.me {
+                            theme.accent()
+                        } else {
+                            theme.strong()
+                        },
+                    ),
+                    Span::raw(" ".repeat(AFTER_NAME)),
+                    Span::styled(
+                        format!(
+                            "📎 {}{target} · {kind} · {} · [{}]",
+                            offer.name,
+                            format_bytes(offer.size),
+                            offer.id.short()
+                        ),
+                        theme.text(),
+                    ),
+                ]));
+
+                if let FilePreview::Image {
+                    thumb_width,
+                    thumb_height,
+                    rgb,
+                    ..
+                } = &offer.preview
+                {
+                    let width = *thumb_width as usize;
+                    let height = *thumb_height as usize;
+                    if width > 0 && height > 0 && rgb.len() >= width * height * 3 {
+                        for y in (0..height).step_by(2) {
+                            let mut spans = vec![Span::raw(" ".repeat(gutter))];
+                            for x in 0..width {
+                                let top = (y * width + x) * 3;
+                                let bottom_y = (y + 1).min(height - 1);
+                                let bottom = (bottom_y * width + x) * 3;
+                                spans.push(Span::styled(
+                                    "▀",
+                                    Style::default()
+                                        .fg(Color::Rgb(rgb[top], rgb[top + 1], rgb[top + 2]))
+                                        .bg(Color::Rgb(
+                                            rgb[bottom],
+                                            rgb[bottom + 1],
+                                            rgb[bottom + 2],
+                                        )),
+                                ));
+                            }
+                            lines.push(TextLine::from(spans));
+                        }
+                    }
+                }
+
+                let action = if offer.recipient.is_none()
+                    && app.viewing == crate::ui::state::FILES_CHANNEL
+                {
+                    format!(
+                        "open #{} to download · /get {}",
+                        app.channel_name(offer.channel),
+                        offer.id.short()
+                    )
+                } else {
+                    format!("/get {}", offer.id.short())
+                };
+                lines.push(TextLine::from(vec![
+                    Span::raw(" ".repeat(gutter)),
+                    Span::styled(action, theme.dim()),
+                ]));
+            }
             Line::Notice { text, at } => {
                 // A notice is the room talking, not a person; it breaks any block.
                 previous = None;
                 for (index, part) in fold(text, room).into_iter().enumerate() {
-                    let head = if index == 0 { pad(&clock(*at), time_column) } else { " ".repeat(time_column) };
+                    let head = if index == 0 {
+                        pad(&clock(*at), time_column)
+                    } else {
+                        " ".repeat(time_column)
+                    };
                     lines.push(TextLine::from(vec![
                         Span::styled(head, theme.dim()),
                         Span::styled(" ".repeat(names.saturating_sub(1)), theme.dim()),
@@ -252,7 +364,12 @@ fn diagram(area: Rect, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
     }
     let mut rows = cans(area.width, app, theme);
     rows.push(TextLine::from(""));
-    rows.extend(closing(&margin_for(area.width), app, theme, &others_of(app)));
+    rows.extend(closing(
+        &margin_for(area.width),
+        app,
+        theme,
+        &others_of(app),
+    ));
 
     // Sit the drawing a little above centre, where the eye looks first.
     let padding = (area.height as usize).saturating_sub(rows.len()) / 3;
@@ -305,17 +422,34 @@ fn cans(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
         TextLine::from(vec![
             Span::raw(margin.clone()),
             Span::styled(pad(&lid, CAN_WIDTH + gap), theme.brass()),
-            Span::styled(if far.is_empty() { String::new() } else { lid.clone() }, theme.brass()),
+            Span::styled(
+                if far.is_empty() {
+                    String::new()
+                } else {
+                    lid.clone()
+                },
+                theme.brass(),
+            ),
         ]),
         TextLine::from(vec![
             Span::raw(margin.clone()),
             Span::styled(can.top.to_string(), theme.text()),
             Span::styled(centre(&label, gap, theme), theme.dim()),
-            Span::styled(if far.is_empty() { String::new() } else { can.top.to_string() }, theme.text()),
+            Span::styled(
+                if far.is_empty() {
+                    String::new()
+                } else {
+                    can.top.to_string()
+                },
+                theme.text(),
+            ),
         ]),
     ];
 
-    let mut middle = vec![Span::raw(margin.clone()), Span::styled(can.body.to_string(), theme.text())];
+    let mut middle = vec![
+        Span::raw(margin.clone()),
+        Span::styled(can.body.to_string(), theme.text()),
+    ];
     middle.extend(string_of(gap, knot, far.is_empty(), theme, strand));
     if !far.is_empty() {
         middle.push(Span::styled(can.body.to_string(), theme.text()));
@@ -325,7 +459,14 @@ fn cans(width: u16, app: &App, theme: &Theme) -> Vec<TextLine<'static>> {
     rows.push(TextLine::from(vec![
         Span::raw(margin.clone()),
         Span::styled(pad(can.bottom, CAN_WIDTH + gap), theme.text()),
-        Span::styled(if far.is_empty() { String::new() } else { can.bottom.to_string() }, theme.text()),
+        Span::styled(
+            if far.is_empty() {
+                String::new()
+            } else {
+                can.bottom.to_string()
+            },
+            theme.text(),
+        ),
     ]));
     rows
 }
@@ -337,7 +478,10 @@ fn compact(width: u16, app: &App, theme: &Theme, others: &[&str]) -> Vec<TextLin
     let text = format!("you {string} {} {string} {far}", link_label(app, theme));
     vec![
         TextLine::from(""),
-        TextLine::from(Span::styled(clip(&text, width as usize, theme), theme.dim())),
+        TextLine::from(Span::styled(
+            clip(&text, width as usize, theme),
+            theme.dim(),
+        )),
     ]
 }
 
@@ -359,35 +503,41 @@ fn string_of(
         return vec![Span::styled(clip(&text, gap, theme), theme.dim())];
     }
     if !knot || gap < 5 {
-        return vec![Span::styled(std::iter::repeat_n(glyph, gap).collect::<String>(), style)];
+        return vec![Span::styled(
+            std::iter::repeat_n(glyph, gap).collect::<String>(),
+            style,
+        )];
     }
     let half = (gap - 1) / 2;
     vec![
         Span::styled(std::iter::repeat_n(glyph, half).collect::<String>(), style),
         Span::styled(theme.glyphs.can.knot.to_string(), theme.brass()),
-        Span::styled(std::iter::repeat_n(glyph, gap - half - 1).collect::<String>(), style),
+        Span::styled(
+            std::iter::repeat_n(glyph, gap - half - 1).collect::<String>(),
+            style,
+        ),
     ]
 }
 
 /// What to do next, which depends entirely on whether anyone is there.
 fn closing(margin: &str, app: &App, theme: &Theme, others: &[&str]) -> Vec<TextLine<'static>> {
     if others.is_empty() {
-        return vec![
-            TextLine::from(vec![
-                Span::raw(margin.to_string()),
-                Span::styled("nobody on the line yet. send them this code:", theme.dim()),
-            ]),
-            TextLine::from(vec![
-                Span::raw(margin.to_string()),
-                Span::styled(app.invite_code.clone(), theme.brass()),
-            ]),
-        ];
+        return vec![TextLine::from(vec![
+            Span::raw(margin.to_string()),
+            Span::styled(
+                "nobody on the line yet. the host can create a one-time invite with f1 or /invite <label>",
+                theme.dim(),
+            ),
+        ])];
     }
     let mut lines = Vec::new();
     if others.len() > 1 {
         lines.push(TextLine::from(vec![
             Span::raw(margin.to_string()),
-            Span::styled(format!("and {} more on the line", others.len() - 1), theme.dim()),
+            Span::styled(
+                format!("and {} more on the line", others.len() - 1),
+                theme.dim(),
+            ),
         ]));
     }
     lines.push(TextLine::from(vec![
@@ -403,7 +553,9 @@ fn closing(margin: &str, app: &App, theme: &Theme, others: &[&str]) -> Vec<TextL
 fn link_label(app: &App, theme: &Theme) -> String {
     let words = strand::label(app).to_lowercase();
     match app.link.worst_rtt {
-        Some(rtt) if app.link.peers() > 0 => format!("{}ms{}{words}", rtt.as_millis(), theme.glyphs.dot),
+        Some(rtt) if app.link.peers() > 0 => {
+            format!("{}ms{}{words}", rtt.as_millis(), theme.glyphs.dot)
+        }
         _ => words,
     }
 }
@@ -472,7 +624,10 @@ mod tests {
     use crate::proto::{ChannelId, ChatLine, PeerInfo};
 
     fn text(line: &TextLine<'_>) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn screen(width: u16, height: u16, app: &App) -> String {
@@ -514,10 +669,25 @@ mod tests {
                 room_name: "lobby".into(),
                 channels: vec!["general".into()],
                 peers: vec![
-                    PeerInfo { id: PeerId([1; 32]), name: "alice".into(), channel: None, muted: false, deafened: false, afk: false },
-                    PeerInfo { id: PeerId([2; 32]), name: "bob".into(), channel: None, muted: false, deafened: false, afk: false },
+                    PeerInfo {
+                        id: PeerId([1; 32]),
+                        name: "alice".into(),
+                        channel: None,
+                        muted: false,
+                        deafened: false,
+                        afk: false,
+                    },
+                    PeerInfo {
+                        id: PeerId([2; 32]),
+                        name: "bob".into(),
+                        channel: None,
+                        muted: false,
+                        deafened: false,
+                        afk: false,
+                    },
                 ],
                 recent_chat: vec![],
+                public_files: vec![],
             },
         });
         app
@@ -532,9 +702,16 @@ mod tests {
 
         let rows = transcript(70, &app, &Theme::from_env());
         assert!(text(&rows[0]).contains("bob"), "{}", text(&rows[0]));
-        assert!(!text(&rows[1]).contains("bob"), "a repeated name is noise: {}", text(&rows[1]));
+        assert!(
+            !text(&rows[1]).contains("bob"),
+            "a repeated name is noise: {}",
+            text(&rows[1])
+        );
         assert!(text(&rows[1]).contains("you there"));
-        assert!(text(&rows[2]).contains("alice"), "a new speaker starts a new block");
+        assert!(
+            text(&rows[2]).contains("alice"),
+            "a new speaker starts a new block"
+        );
     }
 
     #[test]
@@ -544,30 +721,49 @@ mod tests {
         said(&mut app, 2, 1000 + GROUPING_WINDOW + 1, "still there?");
 
         let rows = transcript(70, &app, &Theme::from_env());
-        assert!(text(&rows[1]).contains("bob"), "an hour later is a new thought: {}", text(&rows[1]));
+        assert!(
+            text(&rows[1]).contains("bob"),
+            "an hour later is a new thought: {}",
+            text(&rows[1])
+        );
     }
 
     #[test]
     fn wrapped_messages_stay_in_their_column() {
         let mut app = room();
-        said(&mut app, 2, 1000, "a message long enough that it has to be folded across lines");
+        said(
+            &mut app,
+            2,
+            1000,
+            "a message long enough that it has to be folded across lines",
+        );
 
         let rows = transcript(50, &app, &Theme::from_env());
         assert!(rows.len() > 1, "this should have wrapped");
         let (time_column, ceiling) = columns(50);
         let names = name_column(&app.visible_lines(), &app, ceiling);
         let indent = " ".repeat(time_column + names + AFTER_NAME);
-        assert!(text(&rows[1]).starts_with(&indent), "continuation broke the column: {:?}", text(&rows[1]));
+        assert!(
+            text(&rows[1]).starts_with(&indent),
+            "continuation broke the column: {:?}",
+            text(&rows[1])
+        );
     }
 
     #[test]
     fn folding_never_loses_or_overflows_a_word() {
         let folded = fold("the quick brown fox", 9);
-        assert!(folded.iter().all(|line| line.chars().count() <= 9), "{folded:?}");
+        assert!(
+            folded.iter().all(|line| line.chars().count() <= 9),
+            "{folded:?}"
+        );
         assert_eq!(folded.concat().replace(' ', ""), "thequickbrownfox");
 
         let long = fold("supercalifragilistic", 6);
-        assert!(long.iter().all(|line| line.chars().count() <= 6), "{long:?}");
+        assert!(
+            long.iter().all(|line| line.chars().count() <= 6),
+            "{long:?}"
+        );
         assert_eq!(long.concat(), "supercalifragilistic");
 
         assert_eq!(fold("", 10), vec![""], "an empty message still takes a row");
@@ -581,7 +777,11 @@ mod tests {
         let narrow = transcript(52, &app, &Theme::from_env());
         let (time_column, ceiling) = columns(52);
         assert!(time_column + ceiling < COLUMNS_WIDE.0 + COLUMNS_WIDE.1);
-        assert!(text(&narrow[0]).contains("bob"), "the name still has to fit: {}", text(&narrow[0]));
+        assert!(
+            text(&narrow[0]).contains("bob"),
+            "the name still has to fit: {}",
+            text(&narrow[0])
+        );
         assert!(narrow[0].width() <= 52, "{}", text(&narrow[0]));
     }
 
@@ -603,11 +803,17 @@ mod tests {
     #[test]
     fn the_column_grows_for_the_names_that_are_actually_talking() {
         let short = name_column(&[], &room(), COLUMNS_WIDE.1);
-        assert_eq!(short, NAME_FLOOR, "an empty room keeps the edge and no more");
+        assert_eq!(
+            short, NAME_FLOOR,
+            "an empty room keeps the edge and no more"
+        );
 
         let mut app = room();
         said(&mut app, 2, 1000, "hi");
-        assert_eq!(name_column(&app.visible_lines(), &app, COLUMNS_WIDE.1), "bob".len().max(NAME_FLOOR));
+        assert_eq!(
+            name_column(&app.visible_lines(), &app, COLUMNS_WIDE.1),
+            "bob".len().max(NAME_FLOOR)
+        );
     }
 
     #[test]
@@ -626,8 +832,14 @@ mod tests {
         };
         said(&mut app, 2, 1000, "hi");
 
-        assert!(screen(70, 24, &app).contains("18ms"), "a big empty terminal should still show the link");
-        assert!(!screen(70, 10, &app).contains("18ms"), "a full pane belongs to the conversation");
+        assert!(
+            screen(70, 24, &app).contains("18ms"),
+            "a big empty terminal should still show the link"
+        );
+        assert!(
+            !screen(70, 10, &app).contains("18ms"),
+            "a full pane belongs to the conversation"
+        );
     }
 
     #[test]
@@ -638,7 +850,10 @@ mod tests {
         let drawn = screen(46, 12, &app);
         let rows: Vec<&str> = drawn.lines().collect();
 
-        assert!(rows[0].is_empty(), "the top should be air, not a stranded message: {rows:?}");
+        assert!(
+            rows[0].is_empty(),
+            "the top should be air, not a stranded message: {rows:?}"
+        );
         assert!(
             rows[10].contains("only one line"),
             "the last line belongs just above the field: {rows:?}"
@@ -646,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_room_shows_the_code_instead_of_a_logo() {
+    fn an_empty_room_explains_how_the_host_creates_an_invite() {
         let mut app = room();
         app.peers.retain(|peer| peer.id == app.me);
         let drawn: String = diagram(Rect::new(0, 0, 70, 20), &app, &Theme::from_env())
@@ -655,8 +870,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(drawn.contains("n73w-kuqc-uog2"), "the code is the next step:\n{drawn}");
         assert!(drawn.contains("nobody on the line"), "{drawn}");
+        assert!(
+            drawn.contains("one-time invite") && drawn.contains("/invite"),
+            "the next enrollment step must be visible:\n{drawn}"
+        );
     }
 
     #[test]
@@ -675,7 +893,10 @@ mod tests {
             .join("\n");
 
         assert!(drawn.contains("bob"), "the other end has a name:\n{drawn}");
-        assert!(drawn.contains("18ms"), "the link is measured, not decorated:\n{drawn}");
+        assert!(
+            drawn.contains("18ms"),
+            "the link is measured, not decorated:\n{drawn}"
+        );
         assert!(drawn.contains("direct"), "{drawn}");
     }
 
@@ -687,7 +908,11 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(knotted.contains(theme.glyphs.can.knot), "{knotted}");
-        assert_eq!(knotted.chars().count(), 30, "a knot must not stretch the string");
+        assert_eq!(
+            knotted.chars().count(),
+            30,
+            "a knot must not stretch the string"
+        );
     }
 
     #[test]

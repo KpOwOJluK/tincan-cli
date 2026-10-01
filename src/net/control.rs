@@ -7,8 +7,8 @@
 //! The flow:
 //! ```text
 //! coordinator                            joiner
-//!     │── Challenge{nonce} ───────────────▶│
-//!     │◀── Hello{name, MAC(key, nonce)} ───│
+//!     │── Ready ──────────────────────────▶│
+//!     │◀── Hello{name, one-time token?} ───│
 //!     │── Welcome{you, room} ─────────────▶│   (or Rejected)
 //!     │── Roster / Chat / Notice ─────────▶│   (broadcast)
 //!     │◀── SwitchChannel / Chat / Leave ───│
@@ -17,20 +17,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use iroh::{Endpoint, EndpointAddr};
+use anyhow::{Context, Result, bail, ensure};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::{Endpoint, EndpointAddr};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{debug, warn};
 
 use super::endpoint::to_peer_id;
+use super::file::FileService;
 use super::voice::VoiceMesh;
 use super::{Command, Event, Session, now};
-use crate::auth::{self, Admission, Key};
-use crate::invite;
-use crate::proto::{self, MAX_MESSAGE_BYTES, PeerId, ToCoordinator, ToPeer};
+use crate::access::{Admission as AccessAdmission, ServerAccess};
+use crate::clipboard;
+use crate::invite::{self, InviteToken};
+use crate::proto::{
+    self, FileOffer, MAX_FILE_BYTES, MAX_FILE_NAME_CHARS, MAX_MESSAGE_BYTES, PeerId, ToCoordinator,
+    ToPeer,
+};
 use crate::room::Room;
 
 /// Depth of the broadcast channel. A slow client that falls this far behind is
@@ -42,25 +47,34 @@ const EVENT_DEPTH: usize = 256;
 const RETRY_PAUSE: Duration = Duration::from_secs(2);
 /// What a join that never reached the room says.
 const UNREACHABLE: &str =
-    "could not reach the room — the code, room name or passphrase may be wrong, or the room closed";
+    "could not reach the saved server — it may be offline or the pairing may be stale";
 
 // ── Framing ─────────────────────────────────────────────────────────────────────
 
 async fn write_msg<T: Serialize>(stream: &mut SendStream, message: &T) -> Result<()> {
     let framed = proto::encode(message)?;
-    stream.write_all(&framed).await.context("could not write to the stream")?;
+    stream
+        .write_all(&framed)
+        .await
+        .context("could not write to the stream")?;
     Ok(())
 }
 
 async fn read_msg<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<T> {
     let mut header = [0u8; 4];
-    stream.read_exact(&mut header).await.context("the stream closed")?;
+    stream
+        .read_exact(&mut header)
+        .await
+        .context("the stream closed")?;
     let len = u32::from_le_bytes(header) as usize;
     if len > MAX_MESSAGE_BYTES {
         bail!("the other side announced a {len} byte message — over the limit");
     }
     let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).await.context("the message was cut short")?;
+    stream
+        .read_exact(&mut body)
+        .await
+        .context("the message was cut short")?;
     proto::decode(&body)
 }
 
@@ -71,7 +85,7 @@ pub(crate) struct Shared {
     /// The broadcast that reaches every connected peer **and** the host's own
     /// interface.
     broadcast: broadcast::Sender<ToPeer>,
-    admission: Admission,
+    access: ServerAccess,
 }
 
 impl Shared {
@@ -84,7 +98,9 @@ impl Shared {
 
             ToCoordinator::SwitchChannel { channel } => {
                 room.switch_channel(&from, channel)?;
-                let _ = self.broadcast.send(ToPeer::Roster { peers: room.roster() });
+                let _ = self.broadcast.send(ToPeer::Roster {
+                    peers: room.roster(),
+                });
             }
 
             ToCoordinator::Chat { channel, text } => {
@@ -92,19 +108,100 @@ impl Shared {
                 let _ = self.broadcast.send(ToPeer::Chat(line));
             }
 
+            ToCoordinator::OfferFile {
+                channel,
+                id,
+                recipient,
+                name,
+                size,
+                preview,
+                digest,
+            } => {
+                ensure!(room.get(&from).is_some(), "you are not in the room");
+                ensure!(
+                    room.channels().get(channel.0 as usize).is_some(),
+                    "no such channel: {}",
+                    channel.0
+                );
+                ensure!(size <= MAX_FILE_BYTES, "file is over the size limit");
+                match &preview {
+                    crate::proto::FilePreview::Generic { kind } => {
+                        ensure!(kind.chars().count() <= 16, "file preview kind is too long");
+                    }
+                    crate::proto::FilePreview::Image {
+                        thumb_width,
+                        thumb_height,
+                        rgb,
+                        ..
+                    } => {
+                        ensure!(
+                            *thumb_width <= 24 && *thumb_height <= 12,
+                            "image preview dimensions are too large"
+                        );
+                        let expected = usize::from(*thumb_width)
+                            .saturating_mul(usize::from(*thumb_height))
+                            .saturating_mul(3);
+                        ensure!(rgb.len() == expected, "image preview payload is malformed");
+                    }
+                }
+                if let Some(target) = recipient {
+                    ensure!(
+                        room.get(&target).is_some(),
+                        "the recipient is not in the room"
+                    );
+                    ensure!(
+                        target != from,
+                        "sending a private file to yourself is not useful"
+                    );
+                }
+
+                let clean_name: String = name
+                    .trim()
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .map(|character| match character {
+                        '/' | '\\' => '_',
+                        other => other,
+                    })
+                    .take(MAX_FILE_NAME_CHARS)
+                    .collect();
+                ensure!(!clean_name.is_empty(), "file name is empty");
+
+                let offer = FileOffer {
+                    id,
+                    channel,
+                    from,
+                    recipient,
+                    name: clean_name,
+                    size,
+                    preview,
+                    digest,
+                };
+                if offer.recipient.is_none() {
+                    room.remember_public_file(offer.clone());
+                }
+                let _ = self.broadcast.send(ToPeer::FileOffer(offer));
+            }
+
             ToCoordinator::SetMuted { muted } => {
                 room.set_muted(&from, muted)?;
-                let _ = self.broadcast.send(ToPeer::Roster { peers: room.roster() });
+                let _ = self.broadcast.send(ToPeer::Roster {
+                    peers: room.roster(),
+                });
             }
 
             ToCoordinator::SetDeafened { deafened } => {
                 room.set_deafened(&from, deafened)?;
-                let _ = self.broadcast.send(ToPeer::Roster { peers: room.roster() });
+                let _ = self.broadcast.send(ToPeer::Roster {
+                    peers: room.roster(),
+                });
             }
 
             ToCoordinator::SetAfk { afk } => {
                 room.set_afk(&from, afk)?;
-                let _ = self.broadcast.send(ToPeer::Roster { peers: room.roster() });
+                let _ = self.broadcast.send(ToPeer::Roster {
+                    peers: room.roster(),
+                });
             }
 
             ToCoordinator::Leave => {
@@ -112,7 +209,9 @@ impl Shared {
                     let _ = self.broadcast.send(ToPeer::Notice {
                         text: format!("{} left the room", peer.name),
                     });
-                    let _ = self.broadcast.send(ToPeer::Roster { peers: room.roster() });
+                    let _ = self.broadcast.send(ToPeer::Roster {
+                        peers: room.roster(),
+                    });
                 }
             }
         }
@@ -127,21 +226,21 @@ impl Coordinator {
     pub async fn spawn(
         endpoint: Endpoint,
         room: Room,
-        admission: Admission,
+        access: ServerAccess,
         host_name: &str,
         voice: Option<VoiceMesh>,
     ) -> Result<Session> {
         let me = to_peer_id(endpoint.id());
-        let invite_code = invite::encode(&me.0);
 
         let mut room = room;
-        room.join(me, host_name).context("the host nickname is invalid")?;
+        room.join(me, host_name)
+            .context("the host nickname is invalid")?;
 
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_DEPTH);
         let shared = Arc::new(Shared {
             room: Mutex::new(room),
             broadcast: broadcast_tx,
-            admission,
+            access,
         });
 
         let (event_tx, event_rx) = mpsc::channel(EVENT_DEPTH);
@@ -156,61 +255,239 @@ impl Coordinator {
         tokio::spawn(pump_broadcast_to_ui(
             shared.broadcast.subscribe(),
             event_tx.clone(),
+            me,
         ));
 
-        tokio::spawn(accept_loop(endpoint.clone(), Some(shared.clone()), voice));
-        tokio::spawn(host_commands(shared, command_rx, event_tx, endpoint, me));
+        let files = FileService::new(event_tx.clone());
+
+        tokio::spawn(accept_loop(
+            endpoint.clone(),
+            Some(shared.clone()),
+            voice,
+            files.clone(),
+        ));
+        tokio::spawn(host_commands(
+            shared, command_rx, event_tx, endpoint, me, files,
+        ));
 
         Ok(Session {
             me,
-            invite_code,
+            invite_code: String::new(),
             commands: command_tx,
             events: event_rx,
         })
     }
 }
 
-/// Handles the host's own commands through the same path as network ones.
+/// Обрабатывает локальные команды координатора.
+/// Файловые операции запускаются отдельными задачами, чтобы хеширование и I/O
+/// не блокировали чат, голос и UI.
 async fn host_commands(
     shared: Arc<Shared>,
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
     endpoint: Endpoint,
     me: PeerId,
+    files: FileService,
 ) {
     while let Some(command) = commands.recv().await {
-        if matches!(command, Command::Quit) {
-            let _ = shared.broadcast.send(ToPeer::Notice {
-                text: "the room is closing — the coordinator left".into(),
-            });
-            // A short breath so the broadcast reaches the clients.
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            // Before saying so: once the room has closed the interface exits, and the
-            // process with it.
-            super::endpoint::close_and_retract(&endpoint).await;
-            let _ = events.send(Event::Disconnected("the room was closed".into())).await;
-            break;
-        }
-        if let Err(err) = shared.apply(me, into_wire(command)).await {
-            // The host's own error is not broadcast; it lands on their screen only.
-            let _ = events.send(Event::Notice(format!("that did not work: {err}"))).await;
+        match command {
+            Command::Quit => {
+                let _ = shared.broadcast.send(ToPeer::Notice {
+                    text: "the room is closing — the server stopped".into(),
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                super::endpoint::close_and_retract(&endpoint).await;
+                let _ = events
+                    .send(Event::Disconnected("the room was closed".into()))
+                    .await;
+                break;
+            }
+            Command::ShareFile {
+                channel,
+                recipient,
+                path,
+            } => {
+                spawn_share(
+                    files.clone(),
+                    shared.clone(),
+                    events.clone(),
+                    me,
+                    channel,
+                    recipient,
+                    path,
+                );
+            }
+            Command::DownloadFile { offer, channel } => {
+                spawn_download(
+                    files.clone(),
+                    endpoint.clone(),
+                    events.clone(),
+                    offer,
+                    channel,
+                );
+            }
+            Command::CreateInvite { label } => {
+                match shared.access.create_invite(me, &label) {
+                    Ok(invitation) => {
+                        let code = invite::encode(&invitation);
+                        let copied = clipboard::copy(&code);
+                        let _ = events
+                            .send(Event::Notice(format!(
+                                "one-time invite for {}:",
+                                label.trim()
+                            )))
+                            .await;
+                        let _ = events.send(Event::Notice(code)).await;
+                        if copied {
+                            let _ = events
+                                .send(Event::Notice("copied to clipboard".into()))
+                                .await;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = events
+                            .send(Event::Notice(format!("could not create invite: {err}")))
+                            .await;
+                    }
+                }
+            }
+            Command::ListAuthorized => match shared.access.list_devices() {
+                Ok(devices) if devices.is_empty() => {
+                    let _ = events
+                        .send(Event::Notice("no authorized devices".into()))
+                        .await;
+                }
+                Ok(devices) => {
+                    let _ = events
+                        .send(Event::Notice("authorized devices:".into()))
+                        .await;
+                    for device in devices {
+                        let _ = events
+                            .send(Event::Notice(format!(
+                                "{}  {}  {}",
+                                device.peer.short(), device.peer, device.label
+                            )))
+                            .await;
+                    }
+                }
+                Err(err) => {
+                    let _ = events
+                        .send(Event::Notice(format!("could not list authorized devices: {err}")))
+                        .await;
+                }
+            },
+            Command::RevokeAuthorized { selector } => match shared.access.revoke(&selector) {
+                Ok(device) => {
+                    let _ = events
+                        .send(Event::Notice(format!(
+                            "revoked {} [{}]",
+                            device.label,
+                            device.peer.short()
+                        )))
+                        .await;
+                }
+                Err(err) => {
+                    let _ = events
+                        .send(Event::Notice(format!("could not revoke device: {err}")))
+                        .await;
+                }
+            },
+            other => {
+                let Some(wire) = into_wire(other) else {
+                    let _ = events
+                        .send(Event::Notice("unsupported local command".into()))
+                        .await;
+                    continue;
+                };
+                if let Err(err) = shared.apply(me, wire).await {
+                    let _ = events
+                        .send(Event::Notice(format!("that did not work: {err}")))
+                        .await;
+                }
+            }
         }
     }
     endpoint.close().await;
 }
 
+fn spawn_share(
+    files: FileService,
+    shared: Arc<Shared>,
+    events: mpsc::Sender<Event>,
+    me: PeerId,
+    channel: crate::proto::ChannelId,
+    recipient: Option<PeerId>,
+    path: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        match files.prepare_offer(path, me, channel, recipient).await {
+            Ok(offer) => {
+                let id = offer.id;
+                let wire = ToCoordinator::OfferFile {
+                    channel: offer.channel,
+                    id: offer.id,
+                    recipient: offer.recipient,
+                    name: offer.name,
+                    size: offer.size,
+                    preview: offer.preview,
+                    digest: offer.digest,
+                };
+                if let Err(err) = shared.apply(me, wire).await {
+                    let _ = events
+                        .send(Event::FileFailed {
+                            id: Some(id),
+                            message: format!("could not publish file: {err}"),
+                        })
+                        .await;
+                }
+            }
+            Err(err) => {
+                let _ = events
+                    .send(Event::FileFailed {
+                        id: None,
+                        message: format!("could not prepare file: {err}"),
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+fn spawn_download(
+    files: FileService,
+    endpoint: Endpoint,
+    events: mpsc::Sender<Event>,
+    offer: FileOffer,
+    channel: crate::proto::ChannelId,
+) {
+    tokio::spawn(async move {
+        let id = offer.id;
+        if let Err(err) = files.download(endpoint, offer, channel, None).await {
+            let _ = events
+                .send(Event::FileFailed {
+                    id: Some(id),
+                    message: format!("download failed: {err}"),
+                })
+                .await;
+        }
+    });
+}
+
 /// Routes incoming connections by their ALPN.
 ///
-/// The same endpoint accepts both control and voice connections. On peers that are not
-/// the coordinator `control` is empty — they only answer voice connections.
+/// Один accept-loop обслуживает control, voice и file ALPN.
+/// На обычном участнике `control` отсутствует: он принимает только voice/file.
 pub(crate) async fn accept_loop(
     endpoint: Endpoint,
     control: Option<Arc<Shared>>,
     voice: Option<VoiceMesh>,
+    files: FileService,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let control = control.clone();
         let voice = voice.clone();
+        let files = files.clone();
         tokio::spawn(async move {
             let mut accepting = match incoming.accept() {
                 Ok(accepting) => accepting,
@@ -242,6 +519,13 @@ pub(crate) async fn accept_loop(
                 return;
             }
 
+            if alpn == proto::FILE_ALPN {
+                if let Err(err) = files.accept(conn).await {
+                    debug!("file connection ended with an error: {err:#}");
+                }
+                return;
+            }
+
             let Some(shared) = control else {
                 debug!("a control connection arrived but we are not the coordinator");
                 return;
@@ -260,7 +544,7 @@ pub(crate) async fn accept_loop(
 ///
 /// To **make sure the reason arrives**, the stream is finished and we wait for it to be
 /// read; otherwise the message is lost as the connection closes and the user sees a
-/// meaningless "connection dropped" instead of "wrong password".
+/// meaningless transport error instead of the authorization reason.
 async fn reject(mut send: SendStream, reason: &str) -> Result<()> {
     write_msg(
         &mut send,
@@ -275,25 +559,54 @@ async fn reject(mut send: SendStream, reason: &str) -> Result<()> {
 }
 
 async fn serve_peer(shared: Arc<Shared>, conn: Connection, peer: PeerId) -> Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await.context("could not open the control stream")?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .context("could not open the control stream")?;
 
-    let nonce = auth::random_nonce();
-    write_msg(&mut send, &ToPeer::Challenge { nonce }).await?;
+    // A server-opened QUIC stream is only observable by the peer after the first write.
+    // Ready carries no secret; authentication of the remote device already comes from QUIC.
+    write_msg(&mut send, &ToPeer::Ready).await?;
 
     let hello: ToCoordinator = read_msg(&mut recv).await?;
-    let ToCoordinator::Hello { name, proof } = hello else {
+    let ToCoordinator::Hello { name, invite } = hello else {
         bail!("a different message arrived instead of the handshake");
     };
 
-    if !shared.admission.admits(&nonce, &proof) {
-        warn!("{} tried with the wrong password", peer.short());
-        return reject(send, "wrong room password").await;
+    // Do not burn a one-time token for a malformed nickname. Room::join has the
+    // same normalization rule; duplicate valid names are disambiguated, not rejected.
+    let normalized_name: String = name
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(crate::proto::MAX_NAME_CHARS)
+        .collect();
+    if normalized_name.trim().is_empty() {
+        return reject(send, "a nickname cannot be empty").await;
     }
 
-    let (display_name, snapshot) = {
+    match shared.access.admit(peer, invite)? {
+        AccessAdmission::Known => {}
+        AccessAdmission::Enrolled { ref label } => {
+            debug!("{} enrolled as {label}", peer.short());
+        }
+        AccessAdmission::Denied => {
+            warn!("unauthorized device {} tried to connect", peer.short());
+            return reject(
+                send,
+                "this device is not authorized; ask the host for a new one-time invite",
+            )
+            .await;
+        }
+    }
+
+    // Subscribe before taking the room snapshot. Any offer created while this
+    // handshake is being written will then be queued rather than lost.
+    let mut updates = shared.broadcast.subscribe();
+    let (display_name, snapshot, public_files) = {
         let mut room = shared.room.lock().await;
         match room.join(peer, &name) {
-            Ok(display_name) => (display_name, room.snapshot()),
+            Ok(display_name) => (display_name, room.snapshot(), room.public_files()),
             Err(err) => {
                 let reason = err.to_string();
                 drop(room);
@@ -302,15 +615,28 @@ async fn serve_peer(shared: Arc<Shared>, conn: Connection, peer: PeerId) -> Resu
         }
     };
 
-    write_msg(&mut send, &ToPeer::Welcome { you: peer, room: snapshot }).await?;
+    write_msg(
+        &mut send,
+        &ToPeer::Welcome {
+            you: peer,
+            room: snapshot,
+        },
+    )
+    .await?;
 
-    let mut updates = shared.broadcast.subscribe();
+    // Stream durable public history one offer per control frame. This keeps the
+    // Welcome frame small even after a room has accumulated thousands of files.
+    for offer in public_files {
+        write_msg(&mut send, &ToPeer::FileOffer(offer)).await?;
+    }
     let _ = shared.broadcast.send(ToPeer::Notice {
         text: format!("{display_name} joined the room"),
     });
     {
         let room = shared.room.lock().await;
-        let _ = shared.broadcast.send(ToPeer::Roster { peers: room.roster() });
+        let _ = shared.broadcast.send(ToPeer::Roster {
+            peers: room.roster(),
+        });
     }
 
     // The write side that carries the broadcast to this peer.
@@ -318,6 +644,9 @@ async fn serve_peer(shared: Arc<Shared>, conn: Connection, peer: PeerId) -> Resu
         loop {
             match updates.recv().await {
                 Ok(message) => {
+                    if !message_visible_to(&message, peer) {
+                        continue;
+                    }
                     if write_msg(&mut send, &message).await.is_err() {
                         return;
                     }
@@ -362,19 +691,19 @@ async fn serve_peer(shared: Arc<Shared>, conn: Connection, peer: PeerId) -> Resu
 pub struct Client;
 
 impl Client {
-    /// Connects to the coordinator — named by an invite code, or derived from a room name
-    /// and passphrase — and completes the handshake.
+    /// Connects to the coordinator and completes device authorization.
+    /// A one-time token is only present on the first enrollment.
     ///
     /// In normal use the target is just an identity and discovery finds its address.
     /// Tests skip discovery by passing a full `EndpointAddr`.
     pub async fn connect(
         endpoint: Endpoint,
         target: impl Into<EndpointAddr>,
-        key: &Key,
+        invite: Option<InviteToken>,
         name: &str,
         voice: Option<VoiceMesh>,
     ) -> Result<Session> {
-        Self::connect_patiently(endpoint, target, key, name, voice, Duration::ZERO, |_| {}).await
+        Self::connect_patiently(endpoint, target, invite, name, voice, Duration::ZERO, |_| {}).await
     }
 
     /// [`connect`](Self::connect), but a room that cannot be reached yet is tried again
@@ -387,14 +716,13 @@ impl Client {
     pub async fn connect_patiently(
         endpoint: Endpoint,
         target: impl Into<EndpointAddr>,
-        key: &Key,
+        invite: Option<InviteToken>,
         name: &str,
         voice: Option<VoiceMesh>,
         patience: Duration,
         mut waiting: impl FnMut(Duration),
     ) -> Result<Session> {
         let target: EndpointAddr = target.into();
-        let coordinator = to_peer_id(target.id);
         let deadline = tokio::time::Instant::now() + patience;
         let conn = loop {
             let attempt = endpoint.connect(target.clone(), proto::ALPN);
@@ -422,19 +750,21 @@ impl Client {
             }
         };
 
-        let (mut send, mut recv) = conn.accept_bi().await.context("could not establish the control stream")?;
+        let (mut send, mut recv) = conn
+            .accept_bi()
+            .await
+            .context("could not establish the control stream")?;
 
-        let challenge: ToPeer = read_msg(&mut recv).await?;
-        let ToPeer::Challenge { nonce } = challenge else {
+        let greeting: ToPeer = read_msg(&mut recv).await?;
+        if !matches!(greeting, ToPeer::Ready) {
             bail!("unexpected greeting message");
-        };
+        }
 
-        let proof = auth::proof(key, &nonce);
         write_msg(
             &mut send,
             &ToCoordinator::Hello {
                 name: name.to_string(),
-                proof,
+                invite,
             },
         )
         .await?;
@@ -453,16 +783,18 @@ impl Client {
             .await
             .ok();
 
-        // The joining side must answer voice connections too: the mesh is two-way.
-        if let Some(mesh) = voice {
-            super::voice::spawn_accept(endpoint.clone(), mesh);
-        }
-        tokio::spawn(client_reader(recv, event_tx.clone(), endpoint.clone()));
-        tokio::spawn(client_writer(send, command_rx, conn, endpoint, event_tx));
+        // Joiners use the same accept-loop shape as the coordinator, only without
+        // a control server: incoming voice and file links are both peer-to-peer.
+        let files = FileService::new(event_tx.clone());
+        tokio::spawn(accept_loop(endpoint.clone(), None, voice, files.clone()));
+        tokio::spawn(client_reader(recv, event_tx.clone(), endpoint.clone(), me));
+        tokio::spawn(client_writer(
+            send, command_rx, conn, endpoint, event_tx, me, files,
+        ));
 
         Ok(Session {
             me,
-            invite_code: invite::encode(&coordinator.0),
+            invite_code: String::new(),
             commands: command_tx,
             events: event_rx,
         })
@@ -473,10 +805,14 @@ async fn client_reader(
     mut recv: RecvStream,
     events: mpsc::Sender<Event>,
     endpoint: Endpoint,
+    me: PeerId,
 ) {
     loop {
         match read_msg::<ToPeer>(&mut recv).await {
             Ok(message) => {
+                if !message_visible_to(&message, me) {
+                    continue;
+                }
                 if let Some(event) = wire_to_event(message)
                     && events.send(event).await.is_err()
                 {
@@ -488,7 +824,7 @@ async fn client_reader(
                 // practice it only ever means the room has closed.
                 let _ = events
                     .send(Event::Disconnected(
-                        "lost contact with the room — the coordinator may have left".into(),
+                        "lost contact with the room — the server may have stopped".into(),
                     ))
                     .await;
                 break;
@@ -504,21 +840,87 @@ async fn client_writer(
     conn: Connection,
     endpoint: Endpoint,
     events: mpsc::Sender<Event>,
+    me: PeerId,
+    files: FileService,
 ) {
     while let Some(command) = commands.recv().await {
-        let quitting = matches!(command, Command::Quit);
-        let wire = into_wire(command);
-        if write_msg(&mut send, &wire).await.is_err() {
-            let _ = events
-                .send(Event::Disconnected("cannot reach the coordinator".into()))
-                .await;
-            break;
-        }
-        if quitting {
-            let _ = send.finish();
-            conn.close(0u32.into(), b"ayrildi");
-            let _ = events.send(Event::Disconnected("you left the room".into())).await;
-            break;
+        match command {
+            Command::ShareFile {
+                channel,
+                recipient,
+                path,
+            } => {
+                let offer = match files.prepare_offer(path, me, channel, recipient).await {
+                    Ok(offer) => offer,
+                    Err(err) => {
+                        let _ = events
+                            .send(Event::FileFailed {
+                                id: None,
+                                message: format!("could not prepare file: {err}"),
+                            })
+                            .await;
+                        continue;
+                    }
+                };
+
+                let wire = ToCoordinator::OfferFile {
+                    channel: offer.channel,
+                    id: offer.id,
+                    recipient: offer.recipient,
+                    name: offer.name,
+                    size: offer.size,
+                    preview: offer.preview,
+                    digest: offer.digest,
+                };
+
+                if write_msg(&mut send, &wire).await.is_err() {
+                    let _ = events
+                        .send(Event::Disconnected("cannot reach the server".into()))
+                        .await;
+                    break;
+                }
+            }
+            Command::DownloadFile { offer, channel } => {
+                spawn_download(
+                    files.clone(),
+                    endpoint.clone(),
+                    events.clone(),
+                    offer,
+                    channel,
+                );
+            }
+            Command::CreateInvite { .. }
+            | Command::ListAuthorized
+            | Command::RevokeAuthorized { .. } => {
+                let _ = events
+                    .send(Event::Notice(
+                        "this command is available only on the private-server host".into(),
+                    ))
+                    .await;
+            }
+            other => {
+                let quitting = matches!(other, Command::Quit);
+                let Some(wire) = into_wire(other) else {
+                    let _ = events
+                        .send(Event::Notice("unsupported local command".into()))
+                        .await;
+                    continue;
+                };
+                if write_msg(&mut send, &wire).await.is_err() {
+                    let _ = events
+                        .send(Event::Disconnected("cannot reach the server".into()))
+                        .await;
+                    break;
+                }
+                if quitting {
+                    let _ = send.finish();
+                    conn.close(0u32.into(), b"ayrildi");
+                    let _ = events
+                        .send(Event::Disconnected("you left the room".into()))
+                        .await;
+                    break;
+                }
+            }
         }
     }
     endpoint.close().await;
@@ -526,14 +928,28 @@ async fn client_writer(
 
 // ── Conversions ────────────────────────────────────────────────────────────────
 
-fn into_wire(command: Command) -> ToCoordinator {
+fn into_wire(command: Command) -> Option<ToCoordinator> {
     match command {
-        Command::SwitchChannel(channel) => ToCoordinator::SwitchChannel { channel },
-        Command::Chat { channel, text } => ToCoordinator::Chat { channel, text },
-        Command::SetMuted(muted) => ToCoordinator::SetMuted { muted },
-        Command::SetDeafened(deafened) => ToCoordinator::SetDeafened { deafened },
-        Command::SetAfk(afk) => ToCoordinator::SetAfk { afk },
-        Command::Quit => ToCoordinator::Leave,
+        Command::SwitchChannel(channel) => Some(ToCoordinator::SwitchChannel { channel }),
+        Command::Chat { channel, text } => Some(ToCoordinator::Chat { channel, text }),
+        Command::ShareFile { .. }
+        | Command::DownloadFile { .. }
+        | Command::CreateInvite { .. }
+        | Command::ListAuthorized
+        | Command::RevokeAuthorized { .. } => None,
+        Command::SetMuted(muted) => Some(ToCoordinator::SetMuted { muted }),
+        Command::SetDeafened(deafened) => Some(ToCoordinator::SetDeafened { deafened }),
+        Command::SetAfk(afk) => Some(ToCoordinator::SetAfk { afk }),
+        Command::Quit => Some(ToCoordinator::Leave),
+    }
+}
+
+fn message_visible_to(message: &ToPeer, peer: PeerId) -> bool {
+    match message {
+        ToPeer::FileOffer(offer) => {
+            offer.recipient.is_none() || offer.from == peer || offer.recipient == Some(peer)
+        }
+        _ => true,
     }
 }
 
@@ -541,20 +957,25 @@ fn wire_to_event(message: ToPeer) -> Option<Event> {
     match message {
         ToPeer::Roster { peers } => Some(Event::Roster(peers)),
         ToPeer::Chat(line) => Some(Event::Chat(line)),
+        ToPeer::FileOffer(offer) => Some(Event::FileOffer(offer)),
         ToPeer::Notice { text } => Some(Event::Notice(text)),
         ToPeer::Rejected { reason } => Some(Event::Disconnected(reason)),
-        // Welcome and Challenge are only meaningful during the handshake.
-        ToPeer::Welcome { .. } | ToPeer::Challenge { .. } => None,
+        // Welcome and Ready are only meaningful during the handshake.
+        ToPeer::Welcome { .. } | ToPeer::Ready => None,
     }
 }
 
 async fn pump_broadcast_to_ui(
     mut updates: broadcast::Receiver<ToPeer>,
     events: mpsc::Sender<Event>,
+    me: PeerId,
 ) {
     loop {
         match updates.recv().await {
             Ok(message) => {
+                if !message_visible_to(&message, me) {
+                    continue;
+                }
                 if let Some(event) = wire_to_event(message)
                     && events.send(event).await.is_err()
                 {
@@ -564,5 +985,45 @@ async fn pump_broadcast_to_ui(
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{ChannelId, FilePreview, TransferId};
+
+    fn offer(recipient: Option<PeerId>) -> ToPeer {
+        ToPeer::FileOffer(FileOffer {
+            id: TransferId([7; 16]),
+            channel: ChannelId(1),
+            from: PeerId([1; 32]),
+            recipient,
+            name: "secret.bin".into(),
+            size: 12,
+            preview: FilePreview::Generic { kind: "BIN".into() },
+            digest: [9; 32],
+        })
+    }
+
+    #[test]
+    fn host_only_commands_never_reach_wire_serialization() {
+        assert!(into_wire(Command::CreateInvite { label: "guest".into() }).is_none());
+        assert!(into_wire(Command::ListAuthorized).is_none());
+        assert!(into_wire(Command::RevokeAuthorized { selector: "guest".into() }).is_none());
+    }
+
+    #[test]
+    fn private_file_offer_is_only_visible_to_sender_and_recipient() {
+        let recipient = PeerId([2; 32]);
+        let stranger = PeerId([3; 32]);
+        let private = offer(Some(recipient));
+
+        assert!(message_visible_to(&private, PeerId([1; 32])));
+        assert!(message_visible_to(&private, recipient));
+        assert!(!message_visible_to(&private, stranger));
+
+        let public = offer(None);
+        assert!(message_visible_to(&public, stranger));
     }
 }

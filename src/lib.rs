@@ -8,16 +8,15 @@
 //!   and send Opus packets as unreliable datagrams. Voice never goes through the
 //!   coordinator.
 
-pub mod auth;
+pub mod access;
 pub mod clipboard;
 pub mod config;
 pub mod invite;
 pub mod logo;
-pub mod passphrase;
 pub mod proto;
 pub mod room;
 pub mod stderr;
 
+pub mod audio;
 pub mod net;
 pub mod ui;
-pub mod audio;

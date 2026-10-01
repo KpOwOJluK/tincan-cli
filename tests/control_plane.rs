@@ -1,13 +1,17 @@
 //! End-to-end tests for the control plane: two real iroh endpoints, a real QUIC
 //! connection, a real handshake — but with no relays and no discovery, entirely local.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use iroh::EndpointAddr;
-use tincan::auth::{Admission, Key, RoomSecret};
+use tincan::access::ServerAccess;
+use tincan::invite::InviteToken;
 use tincan::net::control::{Client, Coordinator};
-use tincan::net::endpoint::{bind, bind_offline, bind_offline_as, to_endpoint_id, to_peer_id};
+use tincan::net::endpoint::{bind_offline, bind_offline_as, to_peer_id};
 use tincan::net::{Command, Event, Session};
 use tincan::proto::{ChannelId, PeerInfo};
 use tincan::room::Room;
@@ -19,14 +23,42 @@ fn test_room() -> Room {
     Room::new("test room", vec!["general".into(), "gaming".into()]).unwrap()
 }
 
-/// What a coordinator at `addr` lets in, for a room reached by its invite code.
-fn admits(addr: &EndpointAddr, password: &str) -> Admission {
-    Admission::invite(password, &to_peer_id(addr.id)).unwrap()
+static ACCESS_COUNTER: AtomicU64 = AtomicU64::new(1);
+static TOKENS: LazyLock<Mutex<HashMap<(String, String), InviteToken>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Creates an isolated access store and one pending invite for the following client.
+fn admits(addr: &EndpointAddr, label: &str) -> ServerAccess {
+    let serial = ACCESS_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join(format!("tincan-control-{serial}-{}", std::process::id()))
+        .join("access.toml");
+    let access = ServerAccess::at(path).unwrap();
+    let stored_label = if label.trim().is_empty() {
+        "test-device"
+    } else {
+        label
+    };
+    let invitation = access
+        .create_invite(to_peer_id(addr.id), stored_label)
+        .unwrap();
+    TOKENS
+        .lock()
+        .unwrap()
+        .insert((addr.id.to_string(), label.to_string()), invitation.token);
+    access
 }
 
-/// The key a joiner holding the invite code for `addr` proves itself with.
-fn key_for(addr: &EndpointAddr, password: &str) -> Key {
-    Key::for_invite(password, &to_peer_id(addr.id)).unwrap()
+/// Returns the token created by `admits`; an unknown label intentionally yields junk.
+fn key_for(addr: &EndpointAddr, label: &str) -> Option<InviteToken> {
+    Some(
+        TOKENS
+            .lock()
+            .unwrap()
+            .get(&(addr.id.to_string(), label.to_string()))
+            .copied()
+            .unwrap_or([0xa5; 32]),
+    )
 }
 
 /// Waits for the first event matching a predicate, swallowing the others on the way.
@@ -52,19 +84,27 @@ async fn wait_for<T>(
 }
 
 async fn wait_for_roster(session: &mut Session, count: usize) -> Result<Vec<PeerInfo>> {
-    wait_for(session, &format!("a roster of {count}"), |event| match event {
-        Event::Roster(peers) if peers.len() == count => Some(peers),
-        _ => None,
-    })
+    wait_for(
+        session,
+        &format!("a roster of {count}"),
+        |event| match event {
+            Event::Roster(peers) if peers.len() == count => Some(peers),
+            _ => None,
+        },
+    )
     .await
 }
 
 async fn wait_for_chat(session: &mut Session, text: &str) -> Result<()> {
     let text = text.to_string();
-    wait_for(session, &format!("chat: {text}"), move |event| match event {
-        Event::Chat(line) if line.text == text => Some(()),
-        _ => None,
-    })
+    wait_for(
+        session,
+        &format!("chat: {text}"),
+        move |event| match event {
+            Event::Chat(line) if line.text == text => Some(()),
+            _ => None,
+        },
+    )
     .await
 }
 
@@ -73,18 +113,36 @@ async fn wait_for_chat(session: &mut Session, text: &str) -> Result<()> {
 async fn peer_joins_and_both_sides_converge() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, "password"), "alice", None).await?;
+    let mut host = Coordinator::spawn(
+        host_ep,
+        test_room(),
+        admits(&host_addr, "password"),
+        "alice",
+        None,
+    )
+    .await?;
 
     let welcome = wait_for(&mut host, "host welcome", |e| match e {
         Event::Welcome { room, .. } => Some(room),
         _ => None,
     })
     .await?;
-    assert_eq!(welcome.peers.len(), 1, "the host must see itself in the room");
+    assert_eq!(
+        welcome.peers.len(),
+        1,
+        "the host must see itself in the room"
+    );
     assert_eq!(welcome.channels, vec!["general", "gaming"]);
 
     let guest_ep = bind_offline().await?;
-    let mut guest = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, "password"), "bob", None).await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, "password"),
+        "bob",
+        None,
+    )
+    .await?;
 
     let guest_welcome = wait_for(&mut guest, "guest welcome", |e| match e {
         Event::Welcome { room, .. } => Some(room),
@@ -101,115 +159,64 @@ async fn peer_joins_and_both_sides_converge() -> Result<()> {
     // The host side must see the newcomer too.
     let roster = wait_for_roster(&mut host, 2).await?;
     let names: Vec<&str> = roster.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"alice") && names.contains(&"bob"), "{names:?}");
+    assert!(
+        names.contains(&"alice") && names.contains(&"bob"),
+        "{names:?}"
+    );
 
     assert_ne!(host.me, guest.me, "the identities must differ");
-    assert_eq!(host.invite_code, guest.invite_code, "the same room means the same code");
+    assert_eq!(
+        host.invite_code, guest.invite_code,
+        "the same room means the same code"
+    );
     Ok(())
 }
 
-/// A room opened by name: the joiner derives the host's address from the name and the
-/// passphrase alone, and the invite code still gets in too.
+/// A device that is not yet in the allowlist must present a valid one-time token.
 #[tokio::test]
-async fn a_room_opened_by_name_is_reached_by_name_and_by_code() -> Result<()> {
-    let passphrase = "chestnut-ferry-lens-moss";
-    let secret = RoomSecret::derive("lobby", passphrase)?;
-    let host_ep = bind_offline_as(secret.identity()).await?;
+async fn enrollment_token_is_required_once() -> Result<()> {
+    let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let admission = Admission::room(&secret, passphrase)?;
-    let mut host = Coordinator::spawn(host_ep, test_room(), admission, "alice", None).await?;
+    let access = admits(&host_addr, "bob");
+    let token = key_for(&host_addr, "bob");
+    let mut host = Coordinator::spawn(host_ep, test_room(), access, "alice", None).await?;
 
-    // Typed differently, derived on the other machine: the same address.
-    let joiner = RoomSecret::derive("Lobby", "Chestnut Ferry Lens Moss")?;
-    assert_eq!(to_peer_id(host_addr.id), joiner.coordinator());
+    let unknown = Client::connect(
+        bind_offline().await?,
+        host_addr.clone(),
+        None,
+        "mallory",
+        None,
+    )
+    .await;
+    assert!(unknown.is_err(), "an unknown device must be rejected without an invite");
 
-    let mut by_name = Client::connect(bind_offline().await?, host_addr.clone(), joiner.key(), "bob", None).await?;
-    wait_for(&mut by_name, "welcome by name", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let device_identity = iroh::SecretKey::generate();
+    let guest_ep = bind_offline_as(device_identity.clone()).await?;
+    let first_peer = to_peer_id(guest_ep.id());
+    let mut guest = Client::connect(guest_ep, host_addr.clone(), token, "bob", None).await?;
+    wait_for(&mut guest, "enrolled welcome", |event| {
+        matches!(event, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
+    wait_for_roster(&mut host, 2).await?;
 
-    let by_code_key = key_for(&host_addr, passphrase);
-    let mut by_code = Client::connect(bind_offline().await?, host_addr.clone(), &by_code_key, "carol", None).await?;
-    wait_for(&mut by_code, "welcome by code", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    // Disconnect, recreate the endpoint with exactly the same device identity,
+    // and reconnect without an invite. The persisted allowlist must recognize it.
+    guest.commands.send(Command::Quit).await?;
+    drop(guest);
+    wait_for_roster(&mut host, 1).await?;
 
-    wait_for_roster(&mut host, 3).await?;
-
-    let wrong = RoomSecret::derive("lobby", "chestnut-ferry-lens-mess")?;
-    assert_ne!(wrong.coordinator(), secret.coordinator(), "a wrong passphrase is a different address");
-    let refused = Client::connect(bind_offline().await?, host_addr, wrong.key(), "mallory", None).await;
-    let err = refused.err().expect("a wrong passphrase must not be accepted").to_string();
-    assert!(err.contains("password"), "the error must point at the password: {err}");
-    Ok(())
-}
-
-/// Over the real network: a room opened by name is found from the name and passphrase
-/// alone, through the address records its derived key publishes.
-#[tokio::test]
-#[ignore = "needs the internet and n0's discovery servers"]
-async fn a_named_room_is_found_over_the_network() -> Result<()> {
-    // A made-up name, so the test never lands in somebody's real room.
-    let room = format!("test-{}", tincan::passphrase::generate());
-    let passphrase = tincan::passphrase::generate();
-
-    let secret = RoomSecret::derive(&room, &passphrase)?;
-    let admission = Admission::room(&secret, &passphrase)?;
-    let mut host = Coordinator::spawn(bind(Some(secret.identity())).await?, test_room(), admission, "alice", None).await?;
-
-    let joiner = RoomSecret::derive(&room, &passphrase)?;
-    let target = to_endpoint_id(&joiner.coordinator())?;
-    // Publishing the host's addresses takes a moment; until then the lookup finds nothing.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut guest = loop {
-        match Client::connect(bind(None).await?, target, joiner.key(), "bob", None).await {
-            Ok(session) => break session,
-            Err(err) if tokio::time::Instant::now() < deadline => {
-                eprintln!("not found yet, retrying: {err:#}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Err(err) => return Err(err),
-        }
-    };
-    wait_for(&mut guest, "welcome by name", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let guest_ep = bind_offline_as(device_identity).await?;
+    assert_eq!(to_peer_id(guest_ep.id()), first_peer);
+    let mut guest = Client::connect(guest_ep, host_addr, None, "bob", None).await?;
+    wait_for(&mut guest, "welcome after reconnect", |event| {
+        matches!(event, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 2).await?;
     Ok(())
 }
-
-/// Over the real network: a room whose host has left says so in seconds. Without the
-/// retraction the joiner is sent to the host's last address and waits out iroh's 30 s.
-/// (Measured: ~33 s without it, and the same when the joiner asks the moment the host
-/// has left. Asked a second or more later, 9 runs in 10 heard in ~3 s.)
-#[tokio::test]
-#[ignore = "needs the internet and n0's discovery servers"]
-async fn a_closed_named_room_says_so_quickly() -> Result<()> {
-    let room = format!("test-{}", tincan::passphrase::generate());
-    let passphrase = tincan::passphrase::generate();
-    let secret = RoomSecret::derive(&room, &passphrase)?;
-    let admission = Admission::room(&secret, &passphrase)?;
-    let host = Coordinator::spawn(bind(Some(secret.identity())).await?, test_room(), admission, "alice", None).await?;
-
-    let target = to_endpoint_id(&secret.coordinator())?;
-    let mut guest = Client::connect_patiently(bind(None).await?, target, secret.key(), "bob", None, Duration::from_secs(60), |_| {}).await?;
-    wait_for(&mut guest, "welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
-
-    let mut host = host;
-    host.commands.send(Command::Quit).await?;
-    // The host hears the room has closed only once its record is down.
-    loop {
-        match tokio::time::timeout(PATIENCE, host.events.recv()).await? {
-            Some(Event::Disconnected(_)) => break,
-            Some(_) => {}
-            None => bail!("the host's events ended before the room closed"),
-        }
-    }
-
-    // The empty record takes a moment to reach n0's lookups: asked at once, they still
-    // hand out the old one.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    let started = tokio::time::Instant::now();
-    let late = Client::connect(bind(None).await?, target, secret.key(), "carol", None).await;
-    assert!(late.is_err(), "the room is gone");
-    assert!(started.elapsed() < Duration::from_secs(15), "took {:?} to hear the room is gone", started.elapsed());
-    Ok(())
-}
-
 /// `join --retry` keeps asking for a room with no address yet (a host that has not come
 /// up, or one whose record was taken down), says how long is left before each new
 /// attempt, and gives up on time.
@@ -225,7 +232,7 @@ async fn a_retry_asks_again_and_ends_on_time() -> Result<()> {
     let result = Client::connect_patiently(
         bind_offline().await?,
         no_address,
-        &key_for(&gone_addr, ""),
+        key_for(&gone_addr, ""),
         "bob",
         None,
         Duration::from_secs(5),
@@ -234,10 +241,17 @@ async fn a_retry_asks_again_and_ends_on_time() -> Result<()> {
     .await;
 
     let err = format!("{:#}", result.err().expect("nobody is there"));
-    assert!(err.contains("could not reach the room"), "{err}");
-    assert!(started.elapsed() < Duration::from_secs(8), "took {:?}", started.elapsed());
+    assert!(err.contains("could not reach the saved coordinator"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
     assert!(waits.len() >= 2, "each new attempt is announced: {waits:?}");
-    assert!(waits.windows(2).all(|w| w[0] > w[1]), "the time left counts down: {waits:?}");
+    assert!(
+        waits.windows(2).all(|w| w[0] > w[1]),
+        "the time left counts down: {waits:?}"
+    );
     Ok(())
 }
 
@@ -253,7 +267,7 @@ async fn a_retry_cuts_a_hanging_attempt_off_at_the_deadline() -> Result<()> {
     let result = Client::connect_patiently(
         bind_offline().await?,
         gone_addr.clone(),
-        &key_for(&gone_addr, ""),
+        key_for(&gone_addr, ""),
         "bob",
         None,
         Duration::from_secs(4),
@@ -262,8 +276,12 @@ async fn a_retry_cuts_a_hanging_attempt_off_at_the_deadline() -> Result<()> {
     .await;
 
     let err = format!("{:#}", result.err().expect("nobody is there"));
-    assert!(err.contains("could not reach the room"), "{err}");
-    assert!(started.elapsed() < Duration::from_secs(7), "took {:?}", started.elapsed());
+    assert!(err.contains("could not reach the saved coordinator"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "took {:?}",
+        started.elapsed()
+    );
     Ok(())
 }
 
@@ -272,14 +290,21 @@ async fn a_retry_cuts_a_hanging_attempt_off_at_the_deadline() -> Result<()> {
 async fn a_retry_does_not_repeat_a_refusal() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let _host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, "right-password"), "alice", None).await?;
+    let _host = Coordinator::spawn(
+        host_ep,
+        test_room(),
+        admits(&host_addr, "authorized-device"),
+        "alice",
+        None,
+    )
+    .await?;
 
     let started = tokio::time::Instant::now();
     let mut waits = 0;
     let result = Client::connect_patiently(
         bind_offline().await?,
         host_addr.clone(),
-        &key_for(&host_addr, "wrong-password"),
+        key_for(&host_addr, "unknown-device"),
         "uninvited",
         None,
         Duration::from_secs(30),
@@ -287,25 +312,55 @@ async fn a_retry_does_not_repeat_a_refusal() -> Result<()> {
     )
     .await;
 
-    let err = result.err().expect("a wrong password must not be accepted").to_string();
-    assert!(err.contains("password"), "the error must point at the password: {err}");
+    let err = result
+        .err()
+        .expect("an invalid enrollment token must not be accepted")
+        .to_string();
+    assert!(
+        err.contains("not authorized"),
+        "the error must explain that the device is not authorized: {err}"
+    );
     assert_eq!(waits, 0);
-    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
     Ok(())
 }
 
 /// An attempt with the wrong password must be rejected during the handshake.
 #[tokio::test]
-async fn wrong_password_is_refused() -> Result<()> {
+async fn invalid_invite_is_refused() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let _host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, "right-password"), "alice", None).await?;
+    let _host = Coordinator::spawn(
+        host_ep,
+        test_room(),
+        admits(&host_addr, "authorized-device"),
+        "alice",
+        None,
+    )
+    .await?;
 
     let guest_ep = bind_offline().await?;
-    let result = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, "wrong-password"), "uninvited", None).await;
+    let result = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, "unknown-device"),
+        "uninvited",
+        None,
+    )
+    .await;
 
-    let err = result.err().expect("a wrong password must not be accepted").to_string();
-    assert!(err.contains("password"), "the error must point at the password: {err}");
+    let err = result
+        .err()
+        .expect("an invalid enrollment token must not be accepted")
+        .to_string();
+    assert!(
+        err.contains("not authorized"),
+        "the error must explain that the device is not authorized: {err}"
+    );
     Ok(())
 }
 
@@ -314,12 +369,26 @@ async fn wrong_password_is_refused() -> Result<()> {
 async fn chat_reaches_everyone_including_the_sender() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut host, "host welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut host =
+        Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
+    wait_for(&mut host, "host welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
     let guest_ep = bind_offline().await?;
-    let mut guest = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, ""), "bob", None).await?;
-    wait_for(&mut guest, "guest welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, ""),
+        "bob",
+        None,
+    )
+    .await?;
+    wait_for(&mut guest, "guest welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 2).await?;
 
     // From the joiner to the host.
@@ -350,13 +419,27 @@ async fn chat_reaches_everyone_including_the_sender() -> Result<()> {
 async fn channel_switch_is_visible_to_everyone() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut host, "host welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut host =
+        Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
+    wait_for(&mut host, "host welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
     let guest_ep = bind_offline().await?;
-    let mut guest = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, ""), "bob", None).await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, ""),
+        "bob",
+        None,
+    )
+    .await?;
     let guest_id = guest.me;
-    wait_for(&mut guest, "guest welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    wait_for(&mut guest, "guest welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 2).await?;
 
     guest
@@ -370,17 +453,25 @@ async fn channel_switch_is_visible_to_everyone() -> Result<()> {
             .any(|p| p.id == guest_id && p.channel == Some(ChannelId(1)))
     };
 
-    let host_view = wait_for(&mut host, "the channel switch in the host roster", |e| match e {
-        Event::Roster(peers) if in_channel(&peers) => Some(peers),
-        _ => None,
-    })
+    let host_view = wait_for(
+        &mut host,
+        "the channel switch in the host roster",
+        |e| match e {
+            Event::Roster(peers) if in_channel(&peers) => Some(peers),
+            _ => None,
+        },
+    )
     .await?;
     assert_eq!(host_view.len(), 2);
 
-    wait_for(&mut guest, "the channel switch in the guest roster", |e| match e {
-        Event::Roster(peers) if in_channel(&peers) => Some(()),
-        _ => None,
-    })
+    wait_for(
+        &mut guest,
+        "the channel switch in the guest roster",
+        |e| match e {
+            Event::Roster(peers) if in_channel(&peers) => Some(()),
+            _ => None,
+        },
+    )
     .await?;
     Ok(())
 }
@@ -391,12 +482,26 @@ async fn channel_switch_is_visible_to_everyone() -> Result<()> {
 async fn invalid_channel_request_is_ignored_without_breaking_the_session() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut host, "host welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut host =
+        Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
+    wait_for(&mut host, "host welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
     let guest_ep = bind_offline().await?;
-    let mut guest = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, ""), "bob", None).await?;
-    wait_for(&mut guest, "guest welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, ""),
+        "bob",
+        None,
+    )
+    .await?;
+    wait_for(&mut guest, "guest welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 2).await?;
 
     guest
@@ -421,12 +526,26 @@ async fn invalid_channel_request_is_ignored_without_breaking_the_session() -> Re
 async fn leaving_updates_the_roster() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut host, "host welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut host =
+        Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
+    wait_for(&mut host, "host welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
     let guest_ep = bind_offline().await?;
-    let mut guest = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, ""), "bob", None).await?;
-    wait_for(&mut guest, "guest welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, ""),
+        "bob",
+        None,
+    )
+    .await?;
+    wait_for(&mut guest, "guest welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 2).await?;
 
     guest.commands.send(Command::Quit).await?;
@@ -442,17 +561,34 @@ async fn leaving_updates_the_roster() -> Result<()> {
 async fn duplicate_nicknames_are_disambiguated_over_the_wire() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut host, "host welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut host =
+        Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
+    wait_for(&mut host, "host welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
     let guest_ep = bind_offline().await?;
-    let mut guest = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut guest, "guest welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, ""),
+        "alice",
+        None,
+    )
+    .await?;
+    wait_for(&mut guest, "guest welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
     let roster = wait_for_roster(&mut host, 2).await?;
     let names: Vec<&str> = roster.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names.len(), 2);
-    assert_ne!(names[0], names[1], "the two 'alice's must be distinguishable: {names:?}");
+    assert_ne!(
+        names[0], names[1],
+        "the two 'alice's must be distinguishable: {names:?}"
+    );
     Ok(())
 }
 
@@ -461,15 +597,46 @@ async fn duplicate_nicknames_are_disambiguated_over_the_wire() -> Result<()> {
 async fn three_participants_stay_in_sync() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut host, "host welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let access = admits(&host_addr, "bob");
+    let bob_token = key_for(&host_addr, "bob");
+    let carol_token = Some(
+        access
+            .create_invite(to_peer_id(host_addr.id), "carol")?
+            .token,
+    );
+    let mut host =
+        Coordinator::spawn(host_ep, test_room(), access, "alice", None).await?;
+    wait_for(&mut host, "host welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
-    let mut first = Client::connect(bind_offline().await?, host_addr.clone(), &key_for(&host_addr, ""), "bob", None).await?;
-    wait_for(&mut first, "welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut first = Client::connect(
+        bind_offline().await?,
+        host_addr.clone(),
+        bob_token,
+        "bob",
+        None,
+    )
+    .await?;
+    wait_for(&mut first, "welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 2).await?;
 
-    let mut second = Client::connect(bind_offline().await?, host_addr.clone(), &key_for(&host_addr, ""), "carol", None).await?;
-    wait_for(&mut second, "welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut second = Client::connect(
+        bind_offline().await?,
+        host_addr.clone(),
+        carol_token,
+        "carol",
+        None,
+    )
+    .await?;
+    wait_for(&mut second, "welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 3).await?;
 
     // A message from one joiner must reach the other through the coordinator.
@@ -491,12 +658,26 @@ async fn three_participants_stay_in_sync() -> Result<()> {
 async fn host_quitting_notifies_and_gracefully_disconnects_guest() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut host, "host welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut host =
+        Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
+    wait_for(&mut host, "host welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
     let guest_ep = bind_offline().await?;
-    let mut guest = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, ""), "bob", None).await?;
-    wait_for(&mut guest, "guest welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, ""),
+        "bob",
+        None,
+    )
+    .await?;
+    wait_for(&mut guest, "guest welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 2).await?;
 
     // Host quits.
@@ -517,7 +698,10 @@ async fn host_quitting_notifies_and_gracefully_disconnects_guest() -> Result<()>
         }
     }
     assert!(saw_notice, "guest should have received the closing notice");
-    assert!(saw_disconnect, "guest should have received Event::Disconnected");
+    assert!(
+        saw_disconnect,
+        "guest should have received Event::Disconnected"
+    );
 
     // Dropping guest's commands should close client_writer and terminate cleanly.
     drop(guest.commands);
@@ -530,12 +714,26 @@ async fn host_quitting_notifies_and_gracefully_disconnects_guest() -> Result<()>
 async fn afk_status_is_visible_to_everyone() -> Result<()> {
     let host_ep = bind_offline().await?;
     let host_addr = host_ep.addr();
-    let mut host = Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
-    wait_for(&mut host, "host welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut host =
+        Coordinator::spawn(host_ep, test_room(), admits(&host_addr, ""), "alice", None).await?;
+    wait_for(&mut host, "host welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
 
     let guest_ep = bind_offline().await?;
-    let mut guest = Client::connect(guest_ep, host_addr.clone(), &key_for(&host_addr, ""), "bob", None).await?;
-    wait_for(&mut guest, "guest welcome", |e| matches!(e, Event::Welcome { .. }).then_some(())).await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, ""),
+        "bob",
+        None,
+    )
+    .await?;
+    wait_for(&mut guest, "guest welcome", |e| {
+        matches!(e, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
     wait_for_roster(&mut host, 2).await?;
 
     // Guest marks itself as AFK.
@@ -567,3 +765,77 @@ async fn afk_status_is_visible_to_everyone() -> Result<()> {
     Ok(())
 }
 
+/// Public file metadata is durable for the lifetime of the room and is streamed to
+/// participants that join after the original post.
+#[tokio::test]
+async fn late_joiner_receives_public_file_history() -> Result<()> {
+    let host_ep = bind_offline().await?;
+    let host_addr = host_ep.addr();
+    let mut host = Coordinator::spawn(
+        host_ep,
+        test_room(),
+        admits(&host_addr, "password"),
+        "alice",
+        None,
+    )
+    .await?;
+    wait_for(&mut host, "host welcome", |event| {
+        matches!(event, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path =
+        std::env::temp_dir().join(format!("tincan-history-{}-{nonce}.txt", std::process::id()));
+    tokio::fs::write(&path, b"posted before bob joined").await?;
+
+    host.commands
+        .send(Command::ShareFile {
+            channel: ChannelId(0),
+            recipient: None,
+            path: path.clone(),
+        })
+        .await
+        .unwrap();
+
+    let original = wait_for(&mut host, "host file offer", |event| match event {
+        Event::FileOffer(offer) if offer.name.contains("tincan-history") => Some(offer),
+        _ => None,
+    })
+    .await?;
+
+    let guest_ep = bind_offline().await?;
+    let mut guest = Client::connect(
+        guest_ep,
+        host_addr.clone(),
+        key_for(&host_addr, "password"),
+        "bob",
+        None,
+    )
+    .await?;
+
+    wait_for(&mut guest, "guest welcome", |event| {
+        matches!(event, Event::Welcome { .. }).then_some(())
+    })
+    .await?;
+
+    let historical = wait_for(
+        &mut guest,
+        "historical public file offer",
+        |event| match event {
+            Event::FileOffer(offer) if offer.id == original.id => Some(offer),
+            _ => None,
+        },
+    )
+    .await?;
+
+    assert_eq!(historical.channel, ChannelId(0));
+    assert_eq!(historical.recipient, None);
+    assert_eq!(historical.digest, original.digest);
+
+    let _ = tokio::fs::remove_file(path).await;
+    Ok(())
+}

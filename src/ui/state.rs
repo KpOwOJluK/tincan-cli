@@ -10,12 +10,11 @@ use crate::audio::MicTest;
 use crate::audio::device::AudioDeviceInfo;
 use crate::net::Event;
 use crate::net::voice::LinkStatus;
-use crate::proto::{ChannelId, ChatLine, PeerId, PeerInfo};
-
-
+use crate::proto::{ChannelId, ChatLine, FileOffer, PeerId, PeerInfo};
 
 /// How long a dropout keeps being reported after the audio recovers.
 const DROPOUT_MEMORY: std::time::Duration = std::time::Duration::from_secs(6);
+pub const FILES_CHANNEL: ChannelId = ChannelId(u8::MAX);
 
 /// How long we listen to the room before deciding where its floor is. Long enough to
 /// catch a fan coming round, short enough that nobody wanders off.
@@ -48,6 +47,24 @@ pub const PEER_VOLUME_STEP: f32 = 0.1;
 /// the call pulling the whole room down to make room for one voice.
 pub const PEER_VOLUME_MAX: f32 = 2.0;
 
+/// Форматирует размер файла компактно для терминального интерфейса.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// A measurement of the room in progress.
 #[derive(Debug, Clone, Copy)]
 pub struct Calibration {
@@ -60,6 +77,7 @@ pub struct Calibration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
     Chat(ChatLine),
+    File(FileOffer),
     Notice { text: String, at: u64 },
 }
 
@@ -91,6 +109,8 @@ pub struct App {
     /// roster does, so old messages in the history keep their author's name.
     names: HashMap<PeerId, String>,
     pub lines: Vec<Line>,
+    /// Последние файловые предложения комнаты. Содержимое файлов здесь не хранится.
+    pub file_offers: Vec<FileOffer>,
     /// How far back in the conversation history we are scrolled (0 = bottom / latest).
     pub scroll_offset: usize,
     /// How many new messages arrived while we were scrolled up reading history.
@@ -193,6 +213,7 @@ impl App {
             peers: Vec::new(),
             names: HashMap::new(),
             lines: Vec::new(),
+            file_offers: Vec::new(),
             scroll_offset: 0,
             unread_while_scrolled: 0,
             history_limit: crate::config::DEFAULT_HISTORY_LIMIT,
@@ -251,6 +272,10 @@ impl App {
                 self.channels = room.channels;
                 self.peers = room.peers;
                 self.lines = room.recent_chat.into_iter().map(Line::Chat).collect();
+                self.file_offers.clear();
+                for offer in room.public_files {
+                    self.remember_file_offer(offer);
+                }
                 self.remember_names();
                 // Our own state comes from the server's list, so it stays right
                 // across a reconnect too.
@@ -277,12 +302,72 @@ impl App {
                 }
                 self.push(Line::Chat(line));
             }
+            Event::FileOffer(offer) => {
+                if offer.from == self.me {
+                    self.status = None;
+                }
+
+                if offer.channel != self.viewing && offer.from != self.me {
+                    self.unread.insert(offer.channel);
+                }
+
+                if offer.recipient.is_none()
+                    && self.viewing != FILES_CHANNEL
+                    && offer.from != self.me
+                {
+                    self.unread.insert(FILES_CHANNEL);
+                }
+                self.remember_file_offer(offer);
+            }
+            Event::FileProgress {
+                id,
+                name,
+                transferred,
+                total,
+                receiving,
+            } => {
+                let percent = if total == 0 {
+                    100
+                } else {
+                    transferred.saturating_mul(100) / total
+                };
+                let direction = if receiving { "receiving" } else { "sending" };
+                self.status = Some(format!(
+                    "{direction} {name} [{}] {percent}% · {} / {}",
+                    id.short(),
+                    format_bytes(transferred),
+                    format_bytes(total)
+                ));
+            }
+            Event::FileSaved { id, name, path } => {
+                self.status = None;
+                self.notice(format!(
+                    "file saved: {name} [{}] → {}",
+                    id.short(),
+                    path.display()
+                ));
+            }
+            Event::FileFailed { id, message } => {
+                self.status = None;
+                let prefix = id
+                    .map(|value| format!("[{}] ", value.short()))
+                    .unwrap_or_default();
+                self.notice(format!("file transfer failed: {prefix}{message}"));
+            }
             Event::Notice(text) => {
                 let at = crate::net::now();
                 self.push(Line::Notice { text, at });
             }
             Event::Disconnected(reason) => self.ended = Some(reason),
         }
+    }
+
+    fn remember_file_offer(&mut self, offer: FileOffer) {
+        self.file_offers.retain(|known| known.id != offer.id);
+        self.file_offers.push(offer.clone());
+        self.lines
+            .retain(|line| !matches!(line, Line::File(known) if known.id == offer.id));
+        self.push(Line::File(offer));
     }
 
     /// Puts the full invite code back on screen.
@@ -305,16 +390,33 @@ impl App {
     fn push(&mut self, line: Line) {
         let is_current_channel = match &line {
             Line::Chat(chat) => chat.channel == self.viewing,
-            Line::Notice { .. } => true,
+            Line::File(offer) => self.file_visible_here(offer),
+            Line::Notice { .. } => self.viewing != FILES_CHANNEL,
         };
         if self.scroll_offset > 0 && is_current_channel {
             self.scroll_offset += 1;
             self.unread_while_scrolled += 1;
         }
 
+        let is_file = matches!(line, Line::File(_));
         self.lines.push(line);
-        if self.lines.len() > self.history_limit {
-            self.lines.drain(..self.lines.len() - self.history_limit);
+
+        // File cards are durable room history. Only ordinary chat/notices are bounded
+        // by history_limit, so the synthetic Files channel keeps every public offer.
+        if !is_file {
+            let transient = self
+                .lines
+                .iter()
+                .filter(|line| !matches!(line, Line::File(_)))
+                .count();
+            if transient > self.history_limit
+                && let Some(oldest) = self
+                    .lines
+                    .iter()
+                    .position(|line| !matches!(line, Line::File(_)))
+            {
+                self.lines.remove(oldest);
+            }
         }
     }
 
@@ -322,6 +424,7 @@ impl App {
     pub fn clear_channel_chat(&mut self, channel: ChannelId) {
         self.lines.retain(|line| match line {
             Line::Chat(chat) => chat.channel != channel,
+            Line::File(_) => true,
             Line::Notice { .. } => true,
         });
         self.scroll_to_bottom();
@@ -376,7 +479,8 @@ impl App {
             .iter()
             .filter(|line| match line {
                 Line::Chat(chat) => chat.channel == self.viewing,
-                Line::Notice { .. } => true,
+                Line::File(offer) => self.file_visible_here(offer),
+                Line::Notice { .. } => self.viewing != FILES_CHANNEL,
             })
             .collect()
     }
@@ -392,25 +496,102 @@ impl App {
         self.names.get(&id).cloned().unwrap_or_else(|| id.short())
     }
 
+    /// Ищет файловое предложение по короткому или полному hex-префиксу.
+    pub fn find_file_offer(&self, token: &str) -> Result<FileOffer, String> {
+        let token = token.trim().to_ascii_lowercase();
+        if token.len() < 4 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("file id must contain at least 4 hex characters".into());
+        }
+
+        let matches: Vec<&FileOffer> = self
+            .file_offers
+            .iter()
+            .filter(|offer| offer.id.to_string().starts_with(&token))
+            .collect();
+
+        match matches.as_slice() {
+            [] => Err(format!("no file offer matches {token}")),
+            [offer] => Ok((*offer).clone()),
+            _ => Err(format!(
+                "file id {token} is ambiguous; type more characters"
+            )),
+        }
+    }
+
+    pub fn can_download_here(&self, offer: &FileOffer) -> bool {
+        match offer.recipient {
+            Some(recipient) => recipient == self.me || offer.from == self.me,
+            None => self.viewing == offer.channel,
+        }
+    }
+
+    pub fn file_visible_here(&self, offer: &FileOffer) -> bool {
+        if self.viewing == FILES_CHANNEL {
+            return offer.recipient.is_none();
+        }
+        if offer.recipient.is_some() {
+            return offer.from == self.me || offer.recipient == Some(self.me);
+        }
+        offer.channel == self.viewing
+    }
+
+    pub fn visible_file_offers(&self) -> Vec<&FileOffer> {
+        self.file_offers
+            .iter()
+            .filter(|offer| self.file_visible_here(offer))
+            .collect()
+    }
+
+    pub fn find_peer(&self, token: &str) -> Result<PeerId, String> {
+        let token = token.trim().trim_start_matches('@');
+        let lower = token.to_ascii_lowercase();
+        let mut matches = self.peers.iter().filter(|peer| {
+            peer.id != self.me
+                && (peer.name.eq_ignore_ascii_case(token)
+                    || peer.id.to_string().starts_with(&lower)
+                    || peer.name.to_ascii_lowercase().starts_with(&lower))
+        });
+        let Some(first) = matches.next() else {
+            return Err(format!("no participant matches {token}"));
+        };
+        if matches.next().is_some() {
+            return Err(format!("participant {token} is ambiguous"));
+        }
+        Ok(first.id)
+    }
+
     pub fn channel_name(&self, channel: ChannelId) -> &str {
+        if channel == FILES_CHANNEL {
+            return "Files";
+        }
         self.channels
             .get(channel.0 as usize)
             .map(String::as_str)
             .unwrap_or("?")
     }
 
-    /// Moves to the next channel (viewing only).
+    /// Moves to the next channel (viewing only), including the synthetic Files catalog.
     pub fn view_next(&mut self, forward: bool) {
-        if self.channels.is_empty() {
+        let real = self.channels.len();
+        if real == 0 {
             return;
         }
-        let count = self.channels.len() as u8;
-        self.viewing = ChannelId(if forward {
-            (self.viewing.0 + 1) % count
+        let count = real + 1;
+        let current = if self.viewing == FILES_CHANNEL {
+            real
         } else {
-            (self.viewing.0 + count - 1) % count
-        });
-        // Looking at a channel is what reading it means.
+            (self.viewing.0 as usize).min(real.saturating_sub(1))
+        };
+        let next = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        self.viewing = if next == real {
+            FILES_CHANNEL
+        } else {
+            ChannelId(next as u8)
+        };
         self.unread.remove(&self.viewing);
         self.scroll_to_bottom();
     }
@@ -550,8 +731,7 @@ impl App {
         if self.mic_test == MicTest::Off {
             self.fed_back = false;
             self.mic_test = MicTest::Recording;
-            self.mic_test_until =
-                Some(std::time::Instant::now() + crate::audio::TEST_LENGTH);
+            self.mic_test_until = Some(std::time::Instant::now() + crate::audio::TEST_LENGTH);
         } else {
             self.stop_mic_test();
         }
@@ -650,7 +830,10 @@ impl App {
     /// The sound a key should make, or nothing when the user has asked for quiet.
     pub fn click_for(&self, key: char) -> Option<crate::audio::blip::Blip> {
         (self.typing_clicks && self.typing_volume > 0.0).then_some(
-            crate::audio::blip::Blip::Click { key, volume: self.typing_volume },
+            crate::audio::blip::Blip::Click {
+                key,
+                volume: self.typing_volume,
+            },
         )
     }
 
@@ -705,7 +888,9 @@ impl App {
                     if let Some(idx) = self.input_devices.iter().position(|d| d.name == *active) {
                         self.selected_input_idx = idx;
                     }
-                } else if let Some(default_idx) = self.input_devices.iter().position(|d| d.is_default) {
+                } else if let Some(default_idx) =
+                    self.input_devices.iter().position(|d| d.is_default)
+                {
                     self.selected_input_idx = default_idx;
                 }
                 if self.selected_input_idx >= self.input_devices.len() {
@@ -721,7 +906,9 @@ impl App {
                     if let Some(idx) = self.output_devices.iter().position(|d| d.name == *active) {
                         self.selected_output_idx = idx;
                     }
-                } else if let Some(default_idx) = self.output_devices.iter().position(|d| d.is_default) {
+                } else if let Some(default_idx) =
+                    self.output_devices.iter().position(|d| d.is_default)
+                {
                     self.selected_output_idx = default_idx;
                 }
                 if self.selected_output_idx >= self.output_devices.len() {
@@ -828,6 +1015,7 @@ mod tests {
                 channels: vec!["general".into(), "gaming".into(), "music".into()],
                 peers: vec![peer(1, None), peer(2, Some(ChannelId(1)))],
                 recent_chat: vec![],
+                public_files: vec![],
             },
         });
         app
@@ -912,12 +1100,24 @@ mod tests {
             peer(2, Some(ChannelId(1))),
         ]));
 
-        assert_eq!(app.voice, Some(ChannelId(2)), "the voice channel comes from the roster");
-        assert_eq!(app.viewing, ChannelId(0), "the viewed channel must not change");
+        assert_eq!(
+            app.voice,
+            Some(ChannelId(2)),
+            "the voice channel comes from the roster"
+        );
+        assert_eq!(
+            app.viewing,
+            ChannelId(0),
+            "the viewed channel must not change"
+        );
 
         app.view_next(true);
         assert_eq!(app.viewing, ChannelId(1));
-        assert_eq!(app.voice, Some(ChannelId(2)), "browsing must not move the voice channel");
+        assert_eq!(
+            app.voice,
+            Some(ChannelId(2)),
+            "browsing must not move the voice channel"
+        );
     }
 
     #[test]
@@ -933,7 +1133,10 @@ mod tests {
 
         app.view_next(true);
         assert_eq!(app.viewing, ChannelId(1));
-        assert!(app.unread.is_empty(), "looking at a channel is what reading it means");
+        assert!(
+            app.unread.is_empty(),
+            "looking at a channel is what reading it means"
+        );
     }
 
     #[test]
@@ -953,7 +1156,10 @@ mod tests {
             text: "mine".into(),
             at: 2,
         }));
-        assert!(app.unread.is_empty(), "you do not need telling about your own message");
+        assert!(
+            app.unread.is_empty(),
+            "you do not need telling about your own message"
+        );
     }
 
     #[test]
@@ -965,7 +1171,11 @@ mod tests {
         assert!(app.click_for('a').is_some());
 
         app.nudge_typing_volume(-1.0);
-        assert_eq!(app.click_for('a'), None, "turned all the way down is off too");
+        assert_eq!(
+            app.click_for('a'),
+            None,
+            "turned all the way down is off too"
+        );
     }
 
     #[test]
@@ -992,19 +1202,34 @@ mod tests {
         assert_eq!(seen.len(), 4);
         seen.sort_by_key(|section| format!("{section:?}"));
         seen.dedup();
-        assert_eq!(seen.len(), 4, "tab must reach all four, not loop through three");
+        assert_eq!(
+            seen.len(),
+            4,
+            "tab must reach all four, not loop through three"
+        );
 
         app.settings_next_section(true);
-        assert_eq!(app.settings_section, SettingsSection::InputDevice, "and wrap");
+        assert_eq!(
+            app.settings_section,
+            SettingsSection::InputDevice,
+            "and wrap"
+        );
         app.settings_next_section(false);
-        assert_eq!(app.settings_section, SettingsSection::Typing, "in both directions");
+        assert_eq!(
+            app.settings_section,
+            SettingsSection::Typing,
+            "in both directions"
+        );
     }
 
     #[test]
     fn channel_view_wraps_in_both_directions() {
         let mut app = welcomed();
         app.view_next(false);
-        assert_eq!(app.viewing, ChannelId(2), "must wrap backwards");
+        assert_eq!(
+            app.viewing, FILES_CHANNEL,
+            "must wrap backwards through Files"
+        );
         app.view_next(true);
         assert_eq!(app.viewing, ChannelId(0), "must wrap forwards");
     }
@@ -1031,6 +1256,7 @@ mod tests {
             .iter()
             .map(|line| match line {
                 Line::Chat(c) => c.text.clone(),
+                Line::File(offer) => offer.name.clone(),
                 Line::Notice { text, .. } => text.clone(),
             })
             .collect();
@@ -1042,6 +1268,7 @@ mod tests {
             .iter()
             .map(|line| match line {
                 Line::Chat(c) => c.text.clone(),
+                Line::File(offer) => offer.name.clone(),
                 Line::Notice { text, .. } => text.clone(),
             })
             .collect();
@@ -1054,7 +1281,10 @@ mod tests {
         assert_eq!(app.peers_in(ChannelId(1)).len(), 1);
         assert_eq!(app.peers_in(ChannelId(0)).len(), 0);
 
-        app.apply(Event::Roster(vec![peer(1, Some(ChannelId(0))), peer(2, None)]));
+        app.apply(Event::Roster(vec![
+            peer(1, Some(ChannelId(0))),
+            peer(2, None),
+        ]));
         assert_eq!(app.peers_in(ChannelId(0)).len(), 1);
         assert_eq!(app.peers_in(ChannelId(1)).len(), 0);
     }
@@ -1096,18 +1326,29 @@ mod tests {
         );
 
         app.dropped_at = Some(std::time::Instant::now() - DROPOUT_MEMORY * 2);
-        assert!(!app.recently_dropped(), "old trouble must stop being reported");
+        assert!(
+            !app.recently_dropped(),
+            "old trouble must stop being reported"
+        );
     }
 
     #[test]
     fn the_recorded_test_keeps_the_speaker_shut_while_the_microphone_is_open() {
         let mut app = welcomed();
         app.toggle_recorded_test();
-        assert_eq!(app.mic_test, MicTest::Recording, "recording comes first, on its own");
+        assert_eq!(
+            app.mic_test,
+            MicTest::Recording,
+            "recording comes first, on its own"
+        );
 
         app.mic_test_until = Some(std::time::Instant::now());
         assert!(app.advance_mic_test());
-        assert_eq!(app.mic_test, MicTest::Playing, "and only then does the speaker open");
+        assert_eq!(
+            app.mic_test,
+            MicTest::Playing,
+            "and only then does the speaker open"
+        );
 
         app.mic_test_until = Some(std::time::Instant::now());
         assert!(app.advance_mic_test());
@@ -1130,10 +1371,16 @@ mod tests {
         app.toggle_monitor();
         assert_eq!(app.mic_test, MicTest::Monitoring);
 
-        assert!(!app.watch_for_feedback(1.0), "one loud frame is not yet a verdict");
+        assert!(
+            !app.watch_for_feedback(1.0),
+            "one loud frame is not yet a verdict"
+        );
         app.loud_since = Some(std::time::Instant::now() - RUNAWAY_FOR * 2);
 
-        assert!(app.watch_for_feedback(1.0), "but a level that never comes down is");
+        assert!(
+            app.watch_for_feedback(1.0),
+            "but a level that never comes down is"
+        );
         assert_eq!(app.mic_test, MicTest::Off);
         assert!(app.fed_back, "and the interface has to be able to say why");
     }
@@ -1168,12 +1415,18 @@ mod tests {
         for _ in 0..100 {
             app.nudge_gate(-0.05);
         }
-        assert_eq!(app.input_gate, 0.0, "the bottom of the meter means never gate");
+        assert_eq!(
+            app.input_gate, 0.0,
+            "the bottom of the meter means never gate"
+        );
 
         for _ in 0..100 {
             app.nudge_gate(0.05);
         }
-        assert_eq!(app.input_gate, GATE_CEILING, "and it must never eat the voice entirely");
+        assert_eq!(
+            app.input_gate, GATE_CEILING,
+            "and it must never eat the voice entirely"
+        );
     }
 
     #[test]
@@ -1191,7 +1444,10 @@ mod tests {
     fn measuring_the_room_settles_above_the_loudest_thing_it_heard() {
         let mut app = welcomed();
         app.start_calibration();
-        assert!(app.needs_animation(), "a measurement has to keep the loop awake");
+        assert!(
+            app.needs_animation(),
+            "a measurement has to keep the loop awake"
+        );
         assert_eq!(app.finish_calibration(), None, "it is still listening");
 
         for level in [0.05, 0.22, 0.11] {
@@ -1201,7 +1457,10 @@ mod tests {
         app.calibrating.as_mut().unwrap().until = std::time::Instant::now();
 
         let gate = app.finish_calibration().expect("its time is up");
-        assert!((gate - (0.22 + CALIBRATION_MARGIN)).abs() < 1e-6, "settled at {gate}");
+        assert!(
+            (gate - (0.22 + CALIBRATION_MARGIN)).abs() < 1e-6,
+            "settled at {gate}"
+        );
         assert_eq!(app.input_gate, gate);
         assert!(app.calibrating.is_none(), "and it is over");
         assert_eq!(app.finish_calibration(), None, "it does not fire twice");
@@ -1252,13 +1511,19 @@ mod tests {
     #[test]
     fn a_still_room_asks_for_no_redraws() {
         let mut app = welcomed();
-        assert!(!app.needs_animation(), "nothing is moving, so nothing should wake the loop");
+        assert!(
+            !app.needs_animation(),
+            "nothing is moving, so nothing should wake the loop"
+        );
 
         app.speaking.insert(PeerId([2; 32]));
         assert!(app.needs_animation(), "a travelling pulse needs frames");
 
         app.motion = false;
-        assert!(!app.needs_animation(), "reduced motion must stop the frames, not just the pulse");
+        assert!(
+            !app.needs_animation(),
+            "reduced motion must stop the frames, not just the pulse"
+        );
     }
 
     #[test]
@@ -1282,7 +1547,10 @@ mod tests {
     fn push_to_talk_keeps_the_microphone_shut_until_pressed() {
         let mut app = welcomed();
         app.ptt_mode = true;
-        assert!(!app.mic_open(), "nothing may be transmitted before the key is pressed");
+        assert!(
+            !app.mic_open(),
+            "nothing may be transmitted before the key is pressed"
+        );
 
         app.ptt_active = true;
         assert!(app.mic_open());
@@ -1546,7 +1814,78 @@ mod tests {
         assert_eq!(app.scroll_offset, 4);
 
         app.view_next(true);
-        assert_eq!(app.scroll_offset, 0, "switching channel must reset scroll offset");
+        assert_eq!(
+            app.scroll_offset, 0,
+            "switching channel must reset scroll offset"
+        );
+    }
+
+    fn file_offer(byte: u8, channel: ChannelId, recipient: Option<PeerId>) -> FileOffer {
+        FileOffer {
+            id: crate::proto::TransferId([byte; 16]),
+            channel,
+            from: PeerId([2; 32]),
+            recipient,
+            name: format!("file-{byte}.bin"),
+            size: 128,
+            preview: crate::proto::FilePreview::Generic { kind: "BIN".into() },
+            digest: [byte; 32],
+        }
+    }
+
+    #[test]
+    fn files_catalog_contains_only_public_files() {
+        let mut app = welcomed();
+        let public = file_offer(1, ChannelId(1), None);
+        let private = file_offer(2, ChannelId(1), Some(app.me));
+
+        app.apply(Event::FileOffer(public.clone()));
+        app.apply(Event::FileOffer(private.clone()));
+        app.viewing = FILES_CHANNEL;
+
+        let visible = app.visible_file_offers();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, public.id);
+        assert!(
+            !app.can_download_here(&public),
+            "Files is a catalog, not a public download context"
+        );
+        assert!(
+            app.can_download_here(&private),
+            "a private recipient may download from any channel"
+        );
+    }
+
+    #[test]
+    fn public_file_download_requires_original_channel() {
+        let mut app = welcomed();
+        let offer = file_offer(3, ChannelId(1), None);
+
+        app.viewing = ChannelId(0);
+        assert!(!app.can_download_here(&offer));
+
+        app.viewing = ChannelId(1);
+        assert!(app.can_download_here(&offer));
+    }
+
+    #[test]
+    fn public_file_history_from_snapshot_appears_in_files_catalog() {
+        let public = file_offer(4, ChannelId(2), None);
+        let mut app = App::new(PeerId([1; 32]), "kod".into());
+        app.apply(Event::Welcome {
+            me: PeerId([1; 32]),
+            room: RoomSnapshot {
+                room_name: "oda".into(),
+                channels: vec!["general".into(), "gaming".into(), "music".into()],
+                peers: vec![peer(1, None), peer(2, None)],
+                recent_chat: vec![],
+                public_files: vec![public.clone()],
+            },
+        });
+
+        app.viewing = FILES_CHANNEL;
+        let visible = app.visible_file_offers();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, public.id);
     }
 }
-

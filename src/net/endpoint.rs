@@ -23,7 +23,11 @@ use crate::proto::{self, PeerId};
 /// the same key finds them through the same lookup an invite code goes through.
 pub async fn bind(identity: Option<SecretKey>) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::N0)
-        .alpns(vec![proto::ALPN.to_vec(), proto::VOICE_ALPN.to_vec()])
+        .alpns(vec![
+            proto::ALPN.to_vec(),
+            proto::VOICE_ALPN.to_vec(),
+            proto::FILE_ALPN.to_vec(),
+        ])
         .relay_mode(RelayMode::Default);
     if let Some(identity) = identity {
         builder = builder.secret_key(identity);
@@ -43,7 +47,7 @@ pub async fn bind(identity: Option<SecretKey>) -> Result<Endpoint> {
 /// and waits out iroh's 30 s connection timeout before hearing the room is gone.
 /// Measured against n0's servers: with an empty record published on the way out the
 /// same joiner is told in about 3 s, and a host restarted under the same name and
-/// passphrase is reached as quickly as before, because its fresh record replaces this one.
+/// coordinator is reached as quickly as before, because its fresh record replaces this one.
 /// The empty record takes a moment to reach n0's lookups: a joiner who asks the instant
 /// the host leaves still gets the old one, and in about one run in ten so did one who
 /// asked a few seconds later.
@@ -56,9 +60,11 @@ pub async fn close_and_retract(endpoint: &Endpoint) {
 
     let publishes = endpoint.addr().relay_urls().next().is_some();
     let client = match (endpoint.dns_resolver(), N0_DNS_PKARR_RELAY_PROD.parse()) {
-        (Ok(resolver), Ok(relay)) if publishes => {
-            Some(PkarrRelayClient::new(relay, endpoint.tls_config().clone(), resolver.clone()))
-        }
+        (Ok(resolver), Ok(relay)) if publishes => Some(PkarrRelayClient::new(
+            relay,
+            endpoint.tls_config().clone(),
+            resolver.clone(),
+        )),
         _ => None,
     };
     let secret = endpoint.secret_key().clone();
@@ -67,7 +73,9 @@ pub async fn close_and_retract(endpoint: &Endpoint) {
     let Some(client) = client else {
         return;
     };
-    let empty = match EndpointInfo::new(secret.public()).to_pkarr_signed_packet(&secret, DEFAULT_PKARR_TTL) {
+    let empty = match EndpointInfo::new(secret.public())
+        .to_pkarr_signed_packet(&secret, DEFAULT_PKARR_TTL)
+    {
         Ok(packet) => packet,
         Err(err) => {
             debug!("could not sign the empty address record: {err:#}");
@@ -94,7 +102,11 @@ pub async fn bind_offline() -> Result<Endpoint> {
 pub async fn bind_offline_as(identity: SecretKey) -> Result<Endpoint> {
     Endpoint::builder(presets::Minimal)
         .secret_key(identity)
-        .alpns(vec![proto::ALPN.to_vec(), proto::VOICE_ALPN.to_vec()])
+        .alpns(vec![
+            proto::ALPN.to_vec(),
+            proto::VOICE_ALPN.to_vec(),
+            proto::FILE_ALPN.to_vec(),
+        ])
         .relay_mode(RelayMode::Disabled)
         .bind()
         .await
@@ -109,7 +121,11 @@ pub async fn bind_offline_as(identity: SecretKey) -> Result<Endpoint> {
 pub async fn bind_offline_with_lookup() -> Result<(Endpoint, MemoryLookup)> {
     let lookup = MemoryLookup::default();
     let endpoint = Endpoint::builder(presets::Minimal)
-        .alpns(vec![proto::ALPN.to_vec(), proto::VOICE_ALPN.to_vec()])
+        .alpns(vec![
+            proto::ALPN.to_vec(),
+            proto::VOICE_ALPN.to_vec(),
+            proto::FILE_ALPN.to_vec(),
+        ])
         .relay_mode(RelayMode::Disabled)
         .address_lookup(lookup.clone())
         .bind()
